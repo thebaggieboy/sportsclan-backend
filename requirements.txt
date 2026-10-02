@@ -1,0 +1,11 @@
+Django>=5.2,<5.3
+djangorestframework>=3.16,<3.17
+djangorestframework-simplejwt>=5.5,<6
+django-cors-headers>=4.7,<5
+django-filter>=25,<26
+dj-database-url>=2.3,<4
+psycopg[binary]>=3.2,<4
+gunicorn>=23,<24
+python-dotenv>=1,<2
+Babel>=2.15,<3
+pycountry>=24.6,<25
