@@ -15,7 +15,7 @@ if not DEBUG and SECRET_KEY == "local-only-insecure-secret-key-change-this":
     raise RuntimeError("Set DJANGO_SECRET_KEY before running with DEBUG disabled.")
 ALLOWED_HOSTS = [
     host.strip()
-    for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+    for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1, sportsclan-backend.onrender.com").split(",")
     if host.strip()
 ]
 
