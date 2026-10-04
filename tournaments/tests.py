@@ -465,17 +465,29 @@ class SportsClanApiTests(APITestCase):
         waiting_user = User.objects.create_user(
             username="waiter", email="waiter@example.com", password="StrongPass!246"
         )
+        second_waiting_user = User.objects.create_user(
+            username="waiter2", email="waiter2@example.com", password="StrongPass!246"
+        )
         self.client.force_authenticate(waiting_user)
         waitlist_url = reverse("tournament-waitlist", args=[self.tournament.id])
         joined = self.client.post(waitlist_url, format="json")
         self.assertEqual(joined.status_code, status.HTTP_201_CREATED)
         self.assertEqual(joined.data["position"], 1)
+        self.client.force_authenticate(second_waiting_user)
+        second_joined = self.client.post(waitlist_url, format="json")
+        self.assertEqual(second_joined.data["position"], 2)
 
         self.client.force_authenticate(self.other_player)
         left = self.client.delete(reverse("tournament-leave", args=[self.tournament.id]))
         self.assertEqual(left.status_code, status.HTTP_204_NO_CONTENT)
         notification = UserNotification.objects.get(user=waiting_user)
         self.assertEqual(notification.kind, UserNotification.Kind.SPOT_OPEN)
+        self.assertFalse(UserNotification.objects.filter(user=second_waiting_user).exists())
+        self.client.force_authenticate(self.player)
+        left_again = self.client.delete(reverse("tournament-leave", args=[self.tournament.id]))
+        self.assertEqual(left_again.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(UserNotification.objects.filter(user=waiting_user).count(), 1)
+        self.assertEqual(UserNotification.objects.get(user=second_waiting_user).kind, UserNotification.Kind.SPOT_OPEN)
 
     def test_participant_roster_includes_public_player_card_fields(self):
         self.client.force_authenticate(self.player)
@@ -586,3 +598,19 @@ class SportsClanApiTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.tournament.refresh_from_db()
         self.assertNotEqual(self.tournament.status, Tournament.Status.CANCELLED)
+
+    def test_host_cannot_cancel_while_paid_reservation_is_pending(self):
+        TournamentParticipant.objects.create(
+            tournament=self.tournament,
+            user=self.player,
+            slot_number=1,
+            entry_fee_at_join="5.00",
+            payment_status=TournamentParticipant.PaymentStatus.PENDING,
+            reservation_expires_at=timezone.now() + timedelta(minutes=10),
+        )
+        self.client.force_authenticate(self.host)
+        response = self.client.post(
+            reverse("tournament-cancel", args=[self.tournament.id]), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("pending payment reservations", response.data["detail"])

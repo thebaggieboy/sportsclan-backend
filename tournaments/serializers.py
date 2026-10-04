@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -312,7 +313,10 @@ class TournamentSerializer(serializers.ModelSerializer):
         entry = tournament.waitlist_entries.filter(user=request.user).first()
         if entry is None:
             return None
-        return tournament.waitlist_entries.filter(joined_at__lt=entry.joined_at).count() + 1
+        return tournament.waitlist_entries.filter(tournament=entry.tournament).filter(
+            Q(joined_at__lt=entry.joined_at)
+            | Q(joined_at=entry.joined_at, id__lt=entry.id)
+        ).count() + 1
 
     def get_status(self, tournament):
         if (
@@ -435,9 +439,9 @@ class TournamentWaitlistSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def get_position(self, entry):
-        return TournamentWaitlist.objects.filter(
-            tournament=entry.tournament,
-            joined_at__lt=entry.joined_at,
+        return TournamentWaitlist.objects.filter(tournament=entry.tournament).filter(
+            Q(joined_at__lt=entry.joined_at)
+            | Q(joined_at=entry.joined_at, id__lt=entry.id)
         ).count() + 1
 
 

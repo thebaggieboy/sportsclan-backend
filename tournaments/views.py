@@ -131,7 +131,7 @@ def finalize_paystack_payment(payment, transaction_data):
 
 
 def notify_waitlist_head(tournament):
-    waiting = tournament.waitlist_entries.select_related("user").first()
+    waiting = tournament.waitlist_entries.select_related("user").filter(notified_at__isnull=True).first()
     if waiting:
         UserNotification.objects.create(
             user=waiting.user,
@@ -139,6 +139,8 @@ def notify_waitlist_head(tournament):
             kind=UserNotification.Kind.SPOT_OPEN,
             message=f"A spot opened in {tournament.title}. Claim it before it is taken.",
         )
+        waiting.notified_at = timezone.now()
+        waiting.save(update_fields=["notified_at"])
 
 
 def notify_participants(tournament, kind, message):
@@ -471,10 +473,13 @@ class TournamentViewSet(viewsets.ModelViewSet):
         if tournament.status in {Tournament.Status.CANCELLED, Tournament.Status.COMPLETED}:
             raise ValidationError({"detail": "This tournament can no longer be cancelled."})
         if tournament.active_participants().filter(
-            payment_status=TournamentParticipant.PaymentStatus.PAID
+            payment_status__in=[
+                TournamentParticipant.PaymentStatus.PAID,
+                TournamentParticipant.PaymentStatus.PENDING,
+            ]
         ).exists():
             raise ValidationError(
-                {"detail": "Refund paid entries before cancelling this tournament."}
+                {"detail": "Resolve pending payment reservations and refund paid entries before cancelling this tournament."}
             )
         tournament.status = Tournament.Status.CANCELLED
         tournament.save(update_fields=["status", "updated_at"])
@@ -525,11 +530,13 @@ class TournamentViewSet(viewsets.ModelViewSet):
                     Tournament.objects.select_for_update(), pk=pk
                 )
                 now = timezone.now()
-                TournamentParticipant.objects.filter(
+                expired_reservations = TournamentParticipant.objects.filter(
                     tournament=tournament,
                     payment_status=TournamentParticipant.PaymentStatus.PENDING,
                     reservation_expires_at__lte=now,
-                ).delete()
+                )
+                expired_count = expired_reservations.count()
+                expired_reservations.delete()
                 active_count = tournament.active_participants().count()
                 if tournament.status == Tournament.Status.FULL and active_count < tournament.max_players:
                     tournament.status = Tournament.Status.OPEN
@@ -538,6 +545,8 @@ class TournamentViewSet(viewsets.ModelViewSet):
                     raise ValidationError({"detail": "This tournament is not open."})
                 if tournament.starts_at <= timezone.now():
                     raise ValidationError({"detail": "This tournament has already started."})
+                if expired_count and tournament.slots_open > 0:
+                    notify_waitlist_head(tournament)
                 if slot_number > tournament.max_players:
                     raise ValidationError(
                         {"slot_number": "Choose a slot within the available player spots."}
@@ -611,6 +620,8 @@ class TournamentViewSet(viewsets.ModelViewSet):
                 tournament=tournament, user=request.user
             )
         )
+        if tournament.status == Tournament.Status.CANCELLED:
+            raise ValidationError({"detail": "This tournament was cancelled; payment is unavailable."})
         if participant.payment_status == TournamentParticipant.PaymentStatus.NOT_REQUIRED:
             return Response({"payment_status": participant.payment_status, "amount": "0.00"})
         if participant.payment_status == TournamentParticipant.PaymentStatus.PAID:
@@ -701,6 +712,8 @@ class TournamentViewSet(viewsets.ModelViewSet):
         participant = get_object_or_404(
             TournamentParticipant.objects.filter(tournament=tournament, user=request.user)
         )
+        if tournament.status == Tournament.Status.CANCELLED:
+            raise ValidationError({"detail": "This tournament was cancelled; payment cannot be verified."})
         reference = request.data.get("reference", "")
         payment = get_object_or_404(
             PaystackTransaction.objects.filter(participant=participant, reference=reference)
@@ -740,6 +753,7 @@ class TournamentViewSet(viewsets.ModelViewSet):
             if tournament.status == Tournament.Status.FULL:
                 tournament.status = Tournament.Status.OPEN
                 tournament.save(update_fields=["status", "updated_at"])
+            if tournament.slots_open > 0:
                 notify_waitlist_head(tournament)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
