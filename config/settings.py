@@ -18,6 +18,8 @@ ALLOWED_HOSTS = [
     for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1, sportsclan-backend.onrender.com").split(",")
     if host.strip()
 ]
+PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY", "")
+PAYSTACK_CALLBACK_URL = os.environ.get("PAYSTACK_CALLBACK_URL", "")
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -103,7 +105,7 @@ CORS_ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.environ.get(
         "CORS_ALLOWED_ORIGINS",
-        "http://localhost:8081,http://localhost:8082,http://localhost:19006,http://localhost:3000",
+        "http://localhost:8081,http://localhost:8082,http://localhost:19006,http://localhost:3000,http://localhost:3102,https://sportsclanui.vercel.app",
     ).split(",")
     if origin.strip()
 ]
@@ -122,6 +124,7 @@ REST_FRAMEWORK = {
         "rest_framework.filters.SearchFilter",
     ],
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "DEFAULT_THROTTLE_RATES": {"waitlist": "10/hour"},
     "PAGE_SIZE": 20,
     "DEFAULT_SCHEMA_CLASS": "rest_framework.schemas.openapi.AutoSchema",
 }

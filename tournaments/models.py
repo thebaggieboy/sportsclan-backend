@@ -3,6 +3,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db.models import Q
+from django.utils import timezone
 from decimal import Decimal, ROUND_HALF_UP
 
 
@@ -15,6 +16,23 @@ class Currency(models.Model):
 
 	def __str__(self):
 		return f"{self.code} - {self.name}"
+
+
+class WaitlistSignup(models.Model):
+	class Interest(models.TextChoices):
+		PLAYER = "player", "Player"
+		ORGANIZER = "organizer", "Organizer"
+		TESTER = "tester", "App tester"
+
+	email = models.EmailField(unique=True)
+	interest = models.CharField(max_length=12, choices=Interest.choices)
+	created_at = models.DateTimeField(auto_now_add=True)
+
+	class Meta:
+		ordering = ["-created_at"]
+
+	def __str__(self):
+		return f"{self.email} ({self.interest})"
 
 
 class Country(models.Model):
@@ -165,6 +183,22 @@ class Tournament(models.Model):
 	)
 	sport = models.ForeignKey(Sport, on_delete=models.PROTECT, related_name="tournaments")
 	venue = models.ForeignKey(Venue, on_delete=models.PROTECT, related_name="tournaments")
+	venue_name = models.CharField(max_length=160, blank=True)
+	state = models.CharField(max_length=100, blank=True)
+	latitude = models.DecimalField(
+		max_digits=9,
+		decimal_places=6,
+		null=True,
+		blank=True,
+		validators=[MinValueValidator(-90), MaxValueValidator(90)],
+	)
+	longitude = models.DecimalField(
+		max_digits=9,
+		decimal_places=6,
+		null=True,
+		blank=True,
+		validators=[MinValueValidator(-180), MaxValueValidator(180)],
+	)
 	country = models.ForeignKey(
 		Country,
 		null=True,
@@ -244,7 +278,14 @@ class Tournament(models.Model):
 
 	@property
 	def slots_taken(self):
-		return self.participants.count()
+		return self.active_participants().count()
+
+	def active_participants(self):
+		now = timezone.now()
+		return self.participants.exclude(
+			payment_status="pending",
+			reservation_expires_at__lte=now,
+		)
 
 	@property
 	def slots_open(self):
@@ -273,6 +314,7 @@ class TournamentParticipant(models.Model):
 		PENDING = "pending", "Pending"
 		PAID = "paid", "Paid"
 		REFUNDED = "refunded", "Refunded"
+		NOT_REQUIRED = "not_required", "Not required"
 
 	tournament = models.ForeignKey(
 		Tournament, on_delete=models.CASCADE, related_name="participants"
@@ -285,10 +327,11 @@ class TournamentParticipant(models.Model):
 	slot_number = models.PositiveSmallIntegerField(validators=[MinValueValidator(1)])
 	entry_fee_at_join = models.DecimalField(max_digits=10, decimal_places=2)
 	payment_status = models.CharField(
-		max_length=10,
+		max_length=12,
 		choices=PaymentStatus.choices,
 		default=PaymentStatus.PENDING,
 	)
+	reservation_expires_at = models.DateTimeField(null=True, blank=True)
 	joined_at = models.DateTimeField(auto_now_add=True)
 
 	class Meta:
@@ -304,3 +347,32 @@ class TournamentParticipant(models.Model):
 
 	def __str__(self):
 		return f"{self.user} in {self.tournament} (slot {self.slot_number})"
+
+
+class PaystackTransaction(models.Model):
+	class Status(models.TextChoices):
+		PENDING = "pending", "Pending"
+		SUCCESS = "success", "Success"
+		FAILED = "failed", "Failed"
+		SUCCESS_UNALLOCATED = "success_unallocated", "Success without reserved slot"
+
+	participant = models.ForeignKey(
+		TournamentParticipant,
+		null=True,
+		blank=True,
+		on_delete=models.SET_NULL,
+		related_name="paystack_transactions",
+	)
+	reference = models.CharField(max_length=100, unique=True)
+	amount_minor = models.PositiveBigIntegerField()
+	currency = models.CharField(max_length=3)
+	authorization_url = models.URLField(max_length=500, blank=True)
+	status = models.CharField(max_length=24, choices=Status.choices, default=Status.PENDING)
+	created_at = models.DateTimeField(auto_now_add=True)
+	updated_at = models.DateTimeField(auto_now=True)
+
+	class Meta:
+		ordering = ["-created_at"]
+
+	def __str__(self):
+		return f"{self.reference} ({self.status})"

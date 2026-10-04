@@ -3,7 +3,7 @@ from django.urls import include, path
 from rest_framework.schemas import get_schema_view
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
-from tournaments.views import CurrentUserView, RegisterView
+from tournaments.views import CurrentUserView, PaystackWebhookView, RegisterView
 
 api_schema = get_schema_view(
     title="SportsClan API",
@@ -18,5 +18,6 @@ urlpatterns = [
     path("api/v1/auth/token/", TokenObtainPairView.as_view(), name="token_obtain_pair"),
     path("api/v1/auth/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
     path("api/v1/auth/me/", CurrentUserView.as_view(), name="current_user"),
+    path("api/v1/payments/paystack/webhook/", PaystackWebhookView.as_view(), name="paystack-webhook"),
     path("api/schema/", api_schema, name="api-schema"),
 ]

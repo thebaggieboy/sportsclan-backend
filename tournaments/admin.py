@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Country, CountryCurrency, Currency, Sport, Tournament, TournamentParticipant, Venue
+from .models import Country, CountryCurrency, Currency, Sport, Tournament, TournamentParticipant, Venue, WaitlistSignup
 
 
 class CountryCurrencyInline(admin.TabularInline):
@@ -13,6 +13,14 @@ class CountryCurrencyInline(admin.TabularInline):
 class CurrencyAdmin(admin.ModelAdmin):
 	search_fields = ["code", "name"]
 	list_display = ["code", "name"]
+
+
+@admin.register(WaitlistSignup)
+class WaitlistSignupAdmin(admin.ModelAdmin):
+	list_display = ["email", "interest", "created_at"]
+	list_filter = ["interest", "created_at"]
+	search_fields = ["email"]
+	readonly_fields = ["created_at"]
 
 
 @admin.register(Country)

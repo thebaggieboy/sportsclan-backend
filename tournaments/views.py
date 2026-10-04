@@ -1,5 +1,13 @@
+from datetime import timedelta
 from decimal import Decimal
+import hashlib
+import hmac
+import json
+import secrets
+from urllib.error import HTTPError, URLError
+from urllib.request import Request as HttpRequest, urlopen
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.db.models import Q
@@ -7,14 +15,15 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import APIException, ValidationError
 from rest_framework.generics import RetrieveAPIView
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import Country, Sport, Tournament, TournamentParticipant, Venue
+from .models import Country, PaystackTransaction, Sport, Tournament, TournamentParticipant, Venue, WaitlistSignup
 from .permissions import IsTournamentHostOrReadOnly
 from .serializers import (
     JoinTournamentSerializer,
@@ -25,9 +34,91 @@ from .serializers import (
     TournamentSerializer,
     UserSerializer,
     VenueSerializer,
+    WaitlistSignupSerializer,
 )
 
 User = get_user_model()
+RESERVATION_MINUTES = 15
+PAYSTACK_CURRENCIES = {"GHS", "KES", "NGN", "USD", "ZAR"}
+
+
+class PaymentServiceUnavailable(APIException):
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    default_detail = "Paystack is not configured on the server."
+    default_code = "payment_service_unavailable"
+
+
+def paystack_request(path, payload=None):
+    secret_key = getattr(settings, "PAYSTACK_SECRET_KEY", "")
+    if not secret_key:
+        raise PaymentServiceUnavailable()
+
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = HttpRequest(
+        f"https://api.paystack.co/{path.lstrip('/')}",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {secret_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST" if body is not None else "GET",
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as error:
+        raise APIException("Could not reach Paystack. Try again shortly.") from error
+    if not result.get("status"):
+        raise APIException(result.get("message") or "Paystack could not process this payment.")
+    return result.get("data", {})
+
+
+def finalize_paystack_payment(payment, transaction_data):
+    try:
+        valid_amount = int(transaction_data.get("amount")) == payment.amount_minor
+    except (TypeError, ValueError):
+        valid_amount = False
+    if (
+        transaction_data.get("status") != "success"
+        or transaction_data.get("reference") != payment.reference
+        or transaction_data.get("currency", "").upper() != payment.currency
+        or not valid_amount
+    ):
+        payment.status = PaystackTransaction.Status.FAILED
+        payment.save(update_fields=["status", "updated_at"])
+        return False
+
+    with transaction.atomic():
+        payment = PaystackTransaction.objects.select_for_update().get(pk=payment.pk)
+        if payment.status == PaystackTransaction.Status.SUCCESS:
+            return True
+        participant = payment.participant
+        if participant is None:
+            payment.status = PaystackTransaction.Status.SUCCESS_UNALLOCATED
+            payment.save(update_fields=["status", "updated_at"])
+            return False
+
+        participant = TournamentParticipant.objects.select_for_update().get(pk=participant.pk)
+        tournament = Tournament.objects.select_for_update().get(pk=participant.tournament_id)
+        if (
+            participant.payment_status != TournamentParticipant.PaymentStatus.PENDING
+            or participant.reservation_expires_at is None
+            or participant.reservation_expires_at <= timezone.now()
+        ):
+            payment.status = PaystackTransaction.Status.SUCCESS_UNALLOCATED
+            payment.save(update_fields=["status", "updated_at"])
+            return False
+
+        participant.payment_status = TournamentParticipant.PaymentStatus.PAID
+        participant.reservation_expires_at = None
+        participant.save(update_fields=["payment_status", "reservation_expires_at"])
+        payment.status = PaystackTransaction.Status.SUCCESS
+        payment.save(update_fields=["status", "updated_at"])
+        if tournament.active_participants().count() >= tournament.max_players:
+            tournament.status = Tournament.Status.FULL
+            tournament.save(update_fields=["status", "updated_at"])
+    return True
 
 
 class RegisterView(APIView):
@@ -45,6 +136,25 @@ class RegisterView(APIView):
                 "refresh": str(refresh),
             },
             status=status.HTTP_201_CREATED,
+        )
+
+
+class WaitlistSignupView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "waitlist"
+
+    def post(self, request):
+        serializer = WaitlistSignupSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        _, created = WaitlistSignup.objects.get_or_create(
+            email=serializer.validated_data["email"],
+            defaults={"interest": serializer.validated_data["interest"]},
+        )
+        return Response(
+            {"message": "You're on the SportsClan waitlist."},
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
         )
 
 
@@ -117,26 +227,27 @@ class TournamentViewSet(viewsets.ModelViewSet):
         return queryset
 
     def get_permissions(self):
-        if self.action in {"join", "leave", "mine"}:
+        if self.action in {"join", "leave", "mine", "payment_status", "payment_initialize", "payment_verify"}:
             return [IsAuthenticated()]
         return super().get_permissions()
 
     def perform_create(self, serializer):
-        venue = serializer.validated_data["venue"]
-        venue_fee = Decimal("0.00") if venue.pricing_type == Venue.PricingType.FREE else None
-        venue_fee_status = (
-            Tournament.VenueFeeStatus.NOT_REQUIRED
-            if venue.pricing_type == Venue.PricingType.FREE
-            else Tournament.VenueFeeStatus.PENDING
-        )
-        serializer.save(
-            host=self.request.user,
-            venue_pricing_type_snapshot=venue.pricing_type,
-            venue_rate_snapshot=venue.price_amount,
-            venue_rate_currency_snapshot=venue.price_currency,
-            venue_fee=venue_fee,
-            venue_fee_status=venue_fee_status,
-        )
+        with transaction.atomic():
+            venue = serializer.validated_data.get("venue") or serializer.create_custom_venue()
+            venue_fee = Decimal("0.00") if venue.pricing_type == Venue.PricingType.FREE else None
+            venue_fee_status = (
+                Tournament.VenueFeeStatus.NOT_REQUIRED
+                if venue.pricing_type == Venue.PricingType.FREE
+                else Tournament.VenueFeeStatus.PENDING
+            )
+            serializer.save(
+                host=self.request.user,
+                venue_pricing_type_snapshot=venue.pricing_type,
+                venue_rate_snapshot=venue.price_amount,
+                venue_rate_currency_snapshot=venue.price_currency,
+                venue_fee=venue_fee,
+                venue_fee_status=venue_fee_status,
+            )
 
     def perform_update(self, serializer):
         venue = serializer.validated_data.get("venue")
@@ -180,6 +291,16 @@ class TournamentViewSet(viewsets.ModelViewSet):
                 tournament = get_object_or_404(
                     Tournament.objects.select_for_update(), pk=pk
                 )
+                now = timezone.now()
+                TournamentParticipant.objects.filter(
+                    tournament=tournament,
+                    payment_status=TournamentParticipant.PaymentStatus.PENDING,
+                    reservation_expires_at__lte=now,
+                ).delete()
+                active_count = tournament.active_participants().count()
+                if tournament.status == Tournament.Status.FULL and active_count < tournament.max_players:
+                    tournament.status = Tournament.Status.OPEN
+                    tournament.save(update_fields=["status", "updated_at"])
                 if tournament.status != Tournament.Status.OPEN:
                     raise ValidationError({"detail": "This tournament is not open."})
                 if tournament.starts_at <= timezone.now():
@@ -188,17 +309,28 @@ class TournamentViewSet(viewsets.ModelViewSet):
                     raise ValidationError(
                         {"slot_number": "Choose a slot within the available player spots."}
                     )
-                if tournament.participants.filter(user=request.user).exists():
+                if tournament.active_participants().filter(user=request.user).exists():
                     raise ValidationError({"detail": "You already joined this tournament."})
-                if tournament.participants.count() >= tournament.max_players:
+                if active_count >= tournament.max_players:
                     raise ValidationError({"detail": "All player spots are taken."})
+                if tournament.active_participants().filter(slot_number=slot_number).exists():
+                    raise ValidationError({"slot_number": "That slot has already been taken."})
+                is_free = tournament.entry_fee == Decimal("0.00")
                 participant = TournamentParticipant.objects.create(
                     tournament=tournament,
                     user=request.user,
                     slot_number=slot_number,
                     entry_fee_at_join=tournament.entry_fee,
+                    payment_status=(
+                        TournamentParticipant.PaymentStatus.NOT_REQUIRED
+                        if is_free
+                        else TournamentParticipant.PaymentStatus.PENDING
+                    ),
+                    reservation_expires_at=(
+                        None if is_free else now + timedelta(minutes=RESERVATION_MINUTES)
+                    ),
                 )
-                if tournament.participants.count() >= tournament.max_players:
+                if tournament.active_participants().count() >= tournament.max_players:
                     tournament.status = Tournament.Status.FULL
                     tournament.save(update_fields=["status", "updated_at"])
         except IntegrityError as error:
@@ -210,6 +342,152 @@ class TournamentViewSet(viewsets.ModelViewSet):
             TournamentParticipantSerializer(participant).data,
             status=status.HTTP_201_CREATED,
         )
+
+    @action(detail=True, methods=["get"], url_path="payment-status")
+    def payment_status(self, request, pk=None):
+        tournament = self.get_object()
+        participant = get_object_or_404(
+            TournamentParticipant.objects.filter(tournament=tournament, user=request.user)
+        )
+        latest_payment = participant.paystack_transactions.first()
+        expired = (
+            participant.reservation_expires_at is not None
+            and participant.reservation_expires_at <= timezone.now()
+            and participant.payment_status == TournamentParticipant.PaymentStatus.PENDING
+        )
+        return Response(
+            {
+                "payment_status": participant.payment_status,
+                "reservation_expires_at": participant.reservation_expires_at,
+                "reservation_expired": expired,
+                "slot_number": participant.slot_number,
+                "entry_fee": str(participant.entry_fee_at_join),
+                "currency": tournament.currency,
+                "reference": latest_payment.reference if latest_payment else None,
+                "transaction_status": latest_payment.status if latest_payment else None,
+                "authorization_url": latest_payment.authorization_url if latest_payment else None,
+            }
+        )
+
+    @action(detail=True, methods=["post"], url_path="payment-initialize")
+    def payment_initialize(self, request, pk=None):
+        tournament = self.get_object()
+        participant = get_object_or_404(
+            TournamentParticipant.objects.select_related("user", "tournament").filter(
+                tournament=tournament, user=request.user
+            )
+        )
+        if participant.payment_status == TournamentParticipant.PaymentStatus.NOT_REQUIRED:
+            return Response({"payment_status": participant.payment_status, "amount": "0.00"})
+        if participant.payment_status == TournamentParticipant.PaymentStatus.PAID:
+            return Response({"payment_status": participant.payment_status})
+        if participant.payment_status != TournamentParticipant.PaymentStatus.PENDING:
+            raise ValidationError({"detail": "This entry cannot be paid."})
+
+        now = timezone.now()
+        if participant.reservation_expires_at is None:
+            participant.reservation_expires_at = now + timedelta(minutes=RESERVATION_MINUTES)
+            participant.save(update_fields=["reservation_expires_at"])
+        elif participant.reservation_expires_at <= now:
+            raise ValidationError({"detail": "This slot reservation has expired. Choose an available slot again."})
+
+        currency = tournament.currency.upper()
+        if currency not in PAYSTACK_CURRENCIES:
+            raise ValidationError({"currency": f"Paystack checkout is not enabled for {currency}."})
+        if not participant.user.email:
+            raise ValidationError({"email": "Add an email address to your account before paying."})
+
+        existing = participant.paystack_transactions.filter(
+            status=PaystackTransaction.Status.PENDING,
+            authorization_url__gt="",
+        ).first()
+        if existing:
+            return Response(
+                {
+                    "reference": existing.reference,
+                    "authorization_url": existing.authorization_url,
+                    "payment_status": existing.status,
+                    "amount": str(participant.entry_fee_at_join),
+                    "currency": currency,
+                    "reservation_expires_at": participant.reservation_expires_at,
+                }
+            )
+
+        amount_minor = int((participant.entry_fee_at_join * 100).quantize(Decimal("1")))
+        reference = f"sc-{participant.id}-{secrets.token_hex(12)}"
+        payment = PaystackTransaction.objects.create(
+            participant=participant,
+            reference=reference,
+            amount_minor=amount_minor,
+            currency=currency,
+        )
+        paystack_payload = {
+            "email": participant.user.email,
+            "amount": str(amount_minor),
+            "currency": currency,
+            "reference": reference,
+            "metadata": {
+                "tournament_id": tournament.id,
+                "participant_id": participant.id,
+                "slot_number": participant.slot_number,
+            },
+        }
+        callback_url = getattr(settings, "PAYSTACK_CALLBACK_URL", "")
+        if callback_url:
+            paystack_payload["callback_url"] = callback_url
+
+        try:
+            data = paystack_request("transaction/initialize", paystack_payload)
+        except APIException:
+            payment.status = PaystackTransaction.Status.FAILED
+            payment.save(update_fields=["status", "updated_at"])
+            raise
+        authorization_url = data.get("authorization_url")
+        if not authorization_url:
+            payment.status = PaystackTransaction.Status.FAILED
+            payment.save(update_fields=["status", "updated_at"])
+            raise APIException("Paystack did not return a checkout URL.")
+        payment.authorization_url = authorization_url
+        payment.save(update_fields=["authorization_url", "updated_at"])
+        return Response(
+            {
+                "reference": payment.reference,
+                "authorization_url": payment.authorization_url,
+                "payment_status": payment.status,
+                "amount": str(participant.entry_fee_at_join),
+                "currency": currency,
+                "reservation_expires_at": participant.reservation_expires_at,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["post"], url_path="payment-verify")
+    def payment_verify(self, request, pk=None):
+        tournament = self.get_object()
+        participant = get_object_or_404(
+            TournamentParticipant.objects.filter(tournament=tournament, user=request.user)
+        )
+        reference = request.data.get("reference", "")
+        payment = get_object_or_404(
+            PaystackTransaction.objects.filter(participant=participant, reference=reference)
+        )
+        data = paystack_request(f"transaction/verify/{payment.reference}")
+        if data.get("status") != "success":
+            return Response(
+                {"payment_status": data.get("status", "pending"), "detail": "Paystack has not confirmed this payment yet."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        allocated = finalize_paystack_payment(payment, data)
+        payment.refresh_from_db()
+        if not allocated:
+            return Response(
+                {
+                    "payment_status": payment.status,
+                    "detail": "Payment succeeded after the slot reservation expired. Contact support for a refund.",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response({"payment_status": TournamentParticipant.PaymentStatus.PAID})
 
     @action(detail=True, methods=["delete"])
     def leave(self, request, pk=None):
@@ -229,5 +507,32 @@ class TournamentViewSet(viewsets.ModelViewSet):
                 tournament.status = Tournament.Status.OPEN
                 tournament.save(update_fields=["status", "updated_at"])
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class PaystackWebhookView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        secret_key = getattr(settings, "PAYSTACK_SECRET_KEY", "")
+        signature = request.headers.get("x-paystack-signature", "")
+        expected_signature = hmac.new(
+            secret_key.encode("utf-8"), request.body, hashlib.sha512
+        ).hexdigest()
+        if not secret_key or not hmac.compare_digest(signature, expected_signature):
+            return Response(status=status.HTTP_401_UNAUTHORIZED)
+
+        try:
+            event = json.loads(request.body)
+        except json.JSONDecodeError:
+            return Response(status=status.HTTP_400_BAD_REQUEST)
+        if event.get("event") != "charge.success":
+            return Response({"received": True})
+
+        reference = event.get("data", {}).get("reference")
+        payment = PaystackTransaction.objects.filter(reference=reference).first()
+        if payment:
+            finalize_paystack_payment(payment, event["data"])
+        return Response({"received": True})
 
 # Create your views here.

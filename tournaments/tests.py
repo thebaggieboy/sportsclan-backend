@@ -1,17 +1,30 @@
 from datetime import timedelta
+import hashlib
+import hmac
+import json
+from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
 from django.urls import reverse
 from django.utils import timezone
+from django.test import override_settings
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from .models import Country, CountryCurrency, Currency, Sport, Tournament, TournamentParticipant, Venue
+from .models import Country, CountryCurrency, Currency, PaystackTransaction, Sport, Tournament, TournamentParticipant, Venue, WaitlistSignup
 
 User = get_user_model()
 
 
 class SportsClanApiTests(APITestCase):
+    @staticmethod
+    def mock_paystack_response(data):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(
+            {"status": True, "data": data}
+        ).encode("utf-8")
+        return response
+
     def setUp(self):
         self.host = User.objects.create_user(
             username="host", email="host@example.com", password="StrongPass!246"
@@ -80,6 +93,49 @@ class SportsClanApiTests(APITestCase):
         self.assertIn("access", response.data)
         self.assertIn("refresh", response.data)
 
+    def test_waitlist_signup_is_public_and_deduplicates_email(self):
+        first = self.client.post(
+            reverse("waitlist-signup"),
+            {"email": "  NewPlayer@Example.com ", "interest": "tester"},
+            format="json",
+        )
+        duplicate = self.client.post(
+            reverse("waitlist-signup"),
+            {"email": "newplayer@example.com", "interest": "player"},
+            format="json",
+        )
+
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(duplicate.status_code, status.HTTP_200_OK)
+        self.assertEqual(first.data, duplicate.data)
+        self.assertEqual(WaitlistSignup.objects.count(), 1)
+        signup = WaitlistSignup.objects.get()
+        self.assertEqual(signup.email, "newplayer@example.com")
+        self.assertEqual(signup.interest, WaitlistSignup.Interest.TESTER)
+
+    def test_waitlist_signup_rejects_invalid_email_and_interest(self):
+        response = self.client.post(
+            reverse("waitlist-signup"),
+            {"email": "not-an-email", "interest": "spectator"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(WaitlistSignup.objects.count(), 0)
+
+    def test_waitlist_allows_production_frontend_cors_preflight(self):
+        origin = "https://sportsclanui.vercel.app"
+        with override_settings(CORS_ALLOWED_ORIGINS=[origin]):
+            response = self.client.options(
+                reverse("waitlist-signup"),
+                HTTP_ORIGIN=origin,
+                HTTP_ACCESS_CONTROL_REQUEST_METHOD="POST",
+                HTTP_ACCESS_CONTROL_REQUEST_HEADERS="content-type",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response["Access-Control-Allow-Origin"], origin)
+
     def test_authenticated_host_can_create_tournament(self):
         self.client.force_authenticate(self.host)
         response = self.client.post(
@@ -88,6 +144,10 @@ class SportsClanApiTests(APITestCase):
                 "title": "Saturday Tennis",
                 "sport_id": self.sport.id,
                 "venue_id": self.venue.id,
+                "venue_name": "North Court Entrance",
+                "state": "North District",
+                "latitude": 53.480800,
+                "longitude": -2.242600,
                 "country_id": self.country.code,
                 "starts_at": (timezone.now() + timedelta(days=3)).isoformat(),
                 "entry_fee": "8.50",
@@ -99,6 +159,10 @@ class SportsClanApiTests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data["host"], self.host.username)
+        self.assertEqual(response.data["venue_name"], "North Court Entrance")
+        self.assertEqual(response.data["state"], "North District")
+        self.assertEqual(response.data["latitude"], "53.480800")
+        self.assertEqual(response.data["longitude"], "-2.242600")
         self.assertEqual(response.data["slots_open"], 4)
         self.assertEqual(response.data["projected_prize_pool"], "34.00")
         self.assertEqual(response.data["venue_fee_estimate"], "0.00")
@@ -132,6 +196,34 @@ class SportsClanApiTests(APITestCase):
         self.assertEqual(response.data["venue_fee_estimate"], "30.00")
         self.assertEqual(response.data["venue_fee"], None)
         self.assertEqual(response.data["venue_fee_status"], Tournament.VenueFeeStatus.PENDING)
+
+    def test_host_can_create_tournament_with_a_new_map_venue(self):
+        self.client.force_authenticate(self.host)
+        response = self.client.post(
+            reverse("tournament-list"),
+            {
+                "title": "New Pin Tournament",
+                "sport_id": self.sport.id,
+                "venue_city": "Springfield",
+                "venue_name": "Westside Community Court",
+                "state": "Illinois",
+                "latitude": 39.7817,
+                "longitude": -89.6501,
+                "country_id": self.country.code,
+                "starts_at": (timezone.now() + timedelta(days=3)).isoformat(),
+                "entry_fee": "5.00",
+                "currency": "USD",
+                "max_players": 4,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["venue_name"], "Westside Community Court")
+        self.assertEqual(response.data["state"], "Illinois")
+        self.assertEqual(response.data["venue"]["city"], "Springfield")
+        self.assertEqual(response.data["latitude"], "39.781700")
+        self.assertEqual(response.data["longitude"], "-89.650100")
 
     def test_tournament_currency_must_belong_to_selected_country(self):
         self.client.force_authenticate(self.host)
@@ -239,5 +331,124 @@ class SportsClanApiTests(APITestCase):
         self.assertEqual(first_response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(second_response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(TournamentParticipant.objects.filter(user=self.player).count(), 1)
+
+    def test_expired_reservation_releases_slot_for_another_player(self):
+        self.client.force_authenticate(self.player)
+        join_url = reverse("tournament-join", args=[self.tournament.id])
+        first_response = self.client.post(join_url, {"slot_number": 1}, format="json")
+        participant = TournamentParticipant.objects.get(pk=first_response.data["id"])
+        participant.reservation_expires_at = timezone.now() - timedelta(seconds=1)
+        participant.save(update_fields=["reservation_expires_at"])
+
+        self.client.force_authenticate(self.other_player)
+        second_response = self.client.post(join_url, {"slot_number": 1}, format="json")
+
+        self.assertEqual(second_response.status_code, status.HTTP_201_CREATED)
+        self.assertFalse(TournamentParticipant.objects.filter(pk=participant.pk).exists())
+        self.assertEqual(second_response.data["slot_number"], 1)
+
+    @override_settings(PAYSTACK_SECRET_KEY="sk_test_example")
+    @patch("tournaments.views.urlopen")
+    def test_paystack_initialize_uses_server_amount_and_returns_checkout(self, mock_urlopen):
+        self.client.force_authenticate(self.player)
+        self.client.post(
+            reverse("tournament-join", args=[self.tournament.id]),
+            {"slot_number": 1},
+            format="json",
+        )
+        mock_urlopen.return_value = self.mock_paystack_response(
+            {"authorization_url": "https://checkout.paystack.com/test"}
+        )
+
+        response = self.client.post(
+            reverse("tournament-payment-initialize", args=[self.tournament.id]),
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["authorization_url"], "https://checkout.paystack.com/test")
+        sent_payload = json.loads(mock_urlopen.call_args.args[0].data)
+        self.assertEqual(sent_payload["amount"], "500")
+        self.assertEqual(sent_payload["currency"], "USD")
+
+    @override_settings(PAYSTACK_SECRET_KEY="sk_test_example")
+    @patch("tournaments.views.urlopen")
+    def test_paystack_verification_marks_entry_paid(self, mock_urlopen):
+        self.client.force_authenticate(self.player)
+        self.client.post(
+            reverse("tournament-join", args=[self.tournament.id]),
+            {"slot_number": 1},
+            format="json",
+        )
+        mock_urlopen.return_value = self.mock_paystack_response(
+            {"authorization_url": "https://checkout.paystack.com/test"}
+        )
+        initialized = self.client.post(
+            reverse("tournament-payment-initialize", args=[self.tournament.id]),
+            {},
+            format="json",
+        )
+        reference = initialized.data["reference"]
+        mock_urlopen.return_value = self.mock_paystack_response(
+            {
+                "reference": reference,
+                "status": "success",
+                "amount": 500,
+                "currency": "USD",
+            }
+        )
+
+        response = self.client.post(
+            reverse("tournament-payment-verify", args=[self.tournament.id]),
+            {"reference": reference},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        participant = TournamentParticipant.objects.get(user=self.player, tournament=self.tournament)
+        self.assertEqual(participant.payment_status, TournamentParticipant.PaymentStatus.PAID)
+        self.assertIsNone(participant.reservation_expires_at)
+
+    @override_settings(PAYSTACK_SECRET_KEY="sk_test_example")
+    def test_paystack_webhook_requires_signature_and_marks_entry_paid(self):
+        self.client.force_authenticate(self.player)
+        joined = self.client.post(
+            reverse("tournament-join", args=[self.tournament.id]),
+            {"slot_number": 1},
+            format="json",
+        )
+        participant = TournamentParticipant.objects.get(pk=joined.data["id"])
+        payment = PaystackTransaction.objects.create(
+            participant=participant,
+            reference="sc-test-webhook",
+            amount_minor=500,
+            currency="USD",
+        )
+        event_body = json.dumps(
+            {
+                "event": "charge.success",
+                "data": {
+                    "reference": payment.reference,
+                    "status": "success",
+                    "amount": 500,
+                    "currency": "USD",
+                },
+            }
+        )
+        signature = hmac.new(
+            b"sk_test_example", event_body.encode("utf-8"), hashlib.sha512
+        ).hexdigest()
+
+        response = self.client.post(
+            reverse("paystack-webhook"),
+            event_body,
+            content_type="application/json",
+            HTTP_X_PAYSTACK_SIGNATURE=signature,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        participant.refresh_from_db()
+        self.assertEqual(participant.payment_status, TournamentParticipant.PaymentStatus.PAID)
 
 # Create your tests here.

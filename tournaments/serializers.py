@@ -1,11 +1,21 @@
+from decimal import Decimal
+
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.utils import timezone
 from rest_framework import serializers
 
-from .models import Country, CountryCurrency, Currency, Sport, Tournament, TournamentParticipant, Venue
+from .models import Country, CountryCurrency, Currency, Sport, Tournament, TournamentParticipant, Venue, WaitlistSignup
 
 User = get_user_model()
+
+
+class WaitlistSignupSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    interest = serializers.ChoiceField(choices=WaitlistSignup.Interest.choices)
+
+    def validate_email(self, value):
+        return value.strip().lower()
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -64,15 +74,19 @@ class CountrySerializer(serializers.ModelSerializer):
 class VenueSerializer(serializers.ModelSerializer):
     sports = SportSerializer(many=True, read_only=True)
     country_info = CountrySerializer(source="country_reference", read_only=True)
+    venue_name = serializers.CharField(source="name", read_only=True)
+    state = serializers.CharField(source="region", read_only=True)
 
     class Meta:
         model = Venue
         fields = [
             "id",
             "name",
+            "venue_name",
             "address",
             "city",
             "region",
+            "state",
             "country",
             "country_info",
             "latitude",
@@ -93,8 +107,14 @@ class TournamentSerializer(serializers.ModelSerializer):
         source="sport", queryset=Sport.objects.filter(is_active=True), write_only=True
     )
     venue_id = serializers.PrimaryKeyRelatedField(
-        source="venue", queryset=Venue.objects.filter(is_active=True), write_only=True
+        source="venue", queryset=Venue.objects.filter(is_active=True), write_only=True,
+        required=False, allow_null=True,
     )
+    venue_city = serializers.CharField(write_only=True, required=False, allow_blank=True, max_length=100)
+    venue_name = serializers.CharField(required=False, allow_blank=True, max_length=160)
+    state = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    latitude = serializers.DecimalField(max_digits=9, decimal_places=6, required=False, allow_null=True, min_value=-90, max_value=90)
+    longitude = serializers.DecimalField(max_digits=9, decimal_places=6, required=False, allow_null=True, min_value=-180, max_value=180)
     sport = SportSerializer(read_only=True)
     venue = VenueSerializer(read_only=True)
     host = serializers.CharField(source="host.username", read_only=True)
@@ -114,6 +134,8 @@ class TournamentSerializer(serializers.ModelSerializer):
     taken_slots = serializers.SerializerMethodField()
     is_joined = serializers.SerializerMethodField()
     my_slot = serializers.SerializerMethodField()
+    my_payment_status = serializers.SerializerMethodField()
+    status = serializers.SerializerMethodField()
     venue_fee = serializers.DecimalField(
         max_digits=12, decimal_places=2, required=False, allow_null=True
     )
@@ -128,6 +150,36 @@ class TournamentSerializer(serializers.ModelSerializer):
             fields["venue_fee_status"].read_only = True
         return fields
 
+    def create(self, validated_data):
+        validated_data.pop("venue_city", None)
+        venue = validated_data["venue"]
+        validated_data["venue_name"] = validated_data.get("venue_name") or venue.name
+        validated_data["state"] = validated_data.get("state") or venue.region
+        if validated_data.get("latitude") is None and validated_data.get("longitude") is None:
+            if venue.latitude is not None and venue.longitude is not None:
+                validated_data["latitude"] = venue.latitude
+                validated_data["longitude"] = venue.longitude
+        return super().create(validated_data)
+
+    def create_custom_venue(self):
+        data = self.validated_data
+        country = data["country"]
+        venue = Venue.objects.create(
+            name=data["venue_name"].strip(),
+            city=data["venue_city"].strip(),
+            region=data.get("state", "").strip(),
+            country=country.name,
+            country_reference=country,
+            latitude=data["latitude"],
+            longitude=data["longitude"],
+            pricing_type=Venue.PricingType.FREE,
+            price_amount=Decimal("0.00"),
+            price_currency=data["currency"],
+        )
+        venue.sports.add(data["sport"])
+        data["venue"] = venue
+        return venue
+
     class Meta:
         model = Tournament
         fields = [
@@ -138,7 +190,12 @@ class TournamentSerializer(serializers.ModelSerializer):
             "sport_id",
             "sport",
             "venue_id",
+            "venue_city",
             "venue",
+            "venue_name",
+            "state",
+            "latitude",
+            "longitude",
             "country_id",
             "country",
             "starts_at",
@@ -159,26 +216,25 @@ class TournamentSerializer(serializers.ModelSerializer):
             "status",
             "is_joined",
             "my_slot",
+            "my_payment_status",
             "created_at",
             "updated_at",
         ]
         read_only_fields = ["status", "created_at", "updated_at"]
 
     def get_slots_open(self, tournament):
-        slots_taken = getattr(tournament, "slots_taken", None)
-        if slots_taken is None:
-            slots_taken = tournament.participants.count()
+        slots_taken = tournament.active_participants().count()
         return max(0, tournament.max_players - slots_taken)
 
     def get_is_joined(self, tournament):
         request = self.context.get("request")
         if not request or not request.user.is_authenticated:
             return False
-        return tournament.participants.filter(user=request.user).exists()
+        return tournament.active_participants().filter(user=request.user).exists()
 
     def get_taken_slots(self, tournament):
         return sorted(
-            participant.slot_number for participant in tournament.participants.all()
+            participant.slot_number for participant in tournament.active_participants()
         )
 
     def get_my_slot(self, tournament):
@@ -188,11 +244,26 @@ class TournamentSerializer(serializers.ModelSerializer):
         return next(
             (
                 participant.slot_number
-                for participant in tournament.participants.all()
+                for participant in tournament.active_participants()
                 if participant.user_id == request.user.id
             ),
             None,
         )
+
+    def get_my_payment_status(self, tournament):
+        request = self.context.get("request")
+        if not request or not request.user.is_authenticated:
+            return None
+        participant = tournament.participants.filter(user=request.user).first()
+        return participant.payment_status if participant else None
+
+    def get_status(self, tournament):
+        if (
+            tournament.status == Tournament.Status.FULL
+            and tournament.active_participants().count() < tournament.max_players
+        ):
+            return Tournament.Status.OPEN
+        return tournament.status
 
     def validate(self, attrs):
         sport = attrs.get("sport", getattr(self.instance, "sport", None))
@@ -204,6 +275,18 @@ class TournamentSerializer(serializers.ModelSerializer):
 
         if self.instance is None and country is None:
             raise serializers.ValidationError({"country_id": "Choose a country."})
+        if self.instance is None and venue is None:
+            required_location = {
+                "venue_name": attrs.get("venue_name", "").strip(),
+                "venue_city": attrs.get("venue_city", "").strip(),
+                "latitude": attrs.get("latitude"),
+                "longitude": attrs.get("longitude"),
+            }
+            missing = [field for field, value in required_location.items() if value in ("", None)]
+            if missing:
+                raise serializers.ValidationError(
+                    {field: "Required when selecting a new map location." for field in missing}
+                )
         if country and currency and not country.currency_options.filter(currency_id=currency).exists():
             raise serializers.ValidationError(
                 {"currency": "Choose a currency supported by the selected country."}
@@ -217,6 +300,12 @@ class TournamentSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     {"venue_id": "Choose a venue in the selected country."}
                 )
+        latitude = attrs.get("latitude", getattr(self.instance, "latitude", None))
+        longitude = attrs.get("longitude", getattr(self.instance, "longitude", None))
+        if (latitude is None) != (longitude is None):
+            raise serializers.ValidationError(
+                {"latitude": "Provide both latitude and longitude for the venue pin."}
+            )
         if self.instance is None and starts_at and starts_at <= timezone.now():
             raise serializers.ValidationError({"starts_at": "Choose a future date and time."})
         venue_fee = attrs.get("venue_fee", getattr(self.instance, "venue_fee", None))
@@ -268,6 +357,7 @@ class TournamentParticipantSerializer(serializers.ModelSerializer):
             "slot_number",
             "entry_fee_at_join",
             "payment_status",
+            "reservation_expires_at",
             "joined_at",
         ]
         read_only_fields = fields
