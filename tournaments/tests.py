@@ -11,7 +11,11 @@ from django.test import override_settings
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from .models import Country, CountryCurrency, Currency, PaystackTransaction, Sport, Tournament, TournamentParticipant, Venue, WaitlistSignup
+from .models import (
+    Country, CountryCurrency, Currency, PaystackTransaction, Sport, Tournament,
+    TournamentMessage, TournamentParticipant, TournamentReport, UserNotification,
+    Venue, WaitlistSignup,
+)
 
 User = get_user_model()
 
@@ -451,4 +455,134 @@ class SportsClanApiTests(APITestCase):
         participant.refresh_from_db()
         self.assertEqual(participant.payment_status, TournamentParticipant.PaymentStatus.PAID)
 
-# Create your tests here.
+    def test_full_tournament_waitlist_notifies_next_player_after_spot_opens(self):
+        self.client.force_authenticate(self.player)
+        join_url = reverse("tournament-join", args=[self.tournament.id])
+        self.client.post(join_url, {"slot_number": 1}, format="json")
+        self.client.force_authenticate(self.other_player)
+        self.client.post(join_url, {"slot_number": 2}, format="json")
+
+        waiting_user = User.objects.create_user(
+            username="waiter", email="waiter@example.com", password="StrongPass!246"
+        )
+        self.client.force_authenticate(waiting_user)
+        waitlist_url = reverse("tournament-waitlist", args=[self.tournament.id])
+        joined = self.client.post(waitlist_url, format="json")
+        self.assertEqual(joined.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(joined.data["position"], 1)
+
+        self.client.force_authenticate(self.other_player)
+        left = self.client.delete(reverse("tournament-leave", args=[self.tournament.id]))
+        self.assertEqual(left.status_code, status.HTTP_204_NO_CONTENT)
+        notification = UserNotification.objects.get(user=waiting_user)
+        self.assertEqual(notification.kind, UserNotification.Kind.SPOT_OPEN)
+
+    def test_participant_roster_includes_public_player_card_fields(self):
+        self.client.force_authenticate(self.player)
+        joined = self.client.post(
+            reverse("tournament-join", args=[self.tournament.id]),
+            {"slot_number": 1},
+            format="json",
+        )
+        self.assertEqual(joined.status_code, status.HTTP_201_CREATED)
+        roster = self.client.get(reverse("tournament-participants", args=[self.tournament.id]))
+        self.assertEqual(roster.status_code, status.HTTP_200_OK)
+        self.assertEqual(roster.data[0]["user_id"], self.player.id)
+        self.assertEqual(roster.data[0]["username"], self.player.username)
+        self.assertEqual(roster.data[0]["slot_number"], 1)
+
+    def test_host_can_announce_to_players_and_cancel_with_notifications(self):
+        self.client.force_authenticate(self.player)
+        self.client.post(
+            reverse("tournament-join", args=[self.tournament.id]),
+            {"slot_number": 1},
+            format="json",
+        )
+        self.client.force_authenticate(self.host)
+        message_url = reverse("tournament-messages", args=[self.tournament.id])
+        message = self.client.post(message_url, {"body": "Bring both jerseys."}, format="json")
+        self.assertEqual(message.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(TournamentMessage.objects.count(), 1)
+        self.assertEqual(
+            UserNotification.objects.get(user=self.player).kind,
+            UserNotification.Kind.HOST_ANNOUNCEMENT,
+        )
+        cancelled = self.client.post(
+            reverse("tournament-cancel", args=[self.tournament.id]), format="json"
+        )
+        self.assertEqual(cancelled.status_code, status.HTTP_200_OK)
+        self.tournament.refresh_from_db()
+        self.assertEqual(self.tournament.status, Tournament.Status.CANCELLED)
+        self.assertEqual(UserNotification.objects.filter(user=self.player).count(), 2)
+
+    def test_player_profile_supports_sports_and_completed_game_history(self):
+        self.client.force_authenticate(self.player)
+        endpoint = reverse("my-player-profile")
+        response = self.client.patch(
+            endpoint,
+            {
+                "first_name": "Jordan",
+                "bio": "Weekend basketball player.",
+                "preferred_sport_ids": [self.sport.id],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["first_name"], "Jordan")
+        self.assertEqual(response.data["preferred_sports"][0]["slug"], "basketball")
+
+        TournamentParticipant.objects.create(
+            tournament=self.tournament,
+            user=self.player,
+            slot_number=1,
+            entry_fee_at_join="5.00",
+            payment_status=TournamentParticipant.PaymentStatus.NOT_REQUIRED,
+        )
+        self.tournament.starts_at = timezone.now() - timedelta(hours=2)
+        self.tournament.save(update_fields=["starts_at"])
+        self.client.force_authenticate(self.host)
+        completed = self.client.post(
+            reverse("tournament-complete", args=[self.tournament.id]), format="json"
+        )
+        self.assertEqual(completed.status_code, status.HTTP_200_OK)
+        self.client.force_authenticate(self.player)
+        history = self.client.get(endpoint)
+        self.assertEqual(history.data["games_played"], 1)
+        self.assertEqual(history.data["completed_games"][0]["id"], self.tournament.id)
+
+    def test_player_can_report_tournament_or_another_player(self):
+        self.client.force_authenticate(self.player)
+        game_report = self.client.post(
+            reverse("tournament-report"),
+            {"tournament": self.tournament.id, "reason": "spam", "details": "Misleading details."},
+            format="json",
+        )
+        self.assertEqual(game_report.status_code, status.HTTP_201_CREATED)
+        player_report = self.client.post(
+            reverse("tournament-report"),
+            {"reported_player": self.other_player.id, "reason": "abuse"},
+            format="json",
+        )
+        self.assertEqual(player_report.status_code, status.HTTP_201_CREATED)
+        invalid = self.client.post(
+            reverse("tournament-report"),
+            {"tournament": self.tournament.id, "reported_player": self.other_player.id, "reason": "other"},
+            format="json",
+        )
+        self.assertEqual(invalid.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_host_cannot_cancel_after_player_payment_without_refund(self):
+        TournamentParticipant.objects.create(
+            tournament=self.tournament,
+            user=self.player,
+            slot_number=1,
+            entry_fee_at_join="5.00",
+            payment_status=TournamentParticipant.PaymentStatus.PAID,
+        )
+        self.client.force_authenticate(self.host)
+        response = self.client.post(
+            reverse("tournament-cancel", args=[self.tournament.id]), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.tournament.refresh_from_db()
+        self.assertNotEqual(self.tournament.status, Tournament.Status.CANCELLED)

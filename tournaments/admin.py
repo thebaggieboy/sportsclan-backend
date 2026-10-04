@@ -1,6 +1,47 @@
 from django.contrib import admin
 
-from .models import Country, CountryCurrency, Currency, Sport, Tournament, TournamentParticipant, Venue, WaitlistSignup
+from .models import (
+	Country, CountryCurrency, Currency, PlayerProfile, Sport, Tournament,
+	TournamentMessage, TournamentParticipant, TournamentReport,
+	TournamentWaitlist, UserNotification, Venue, WaitlistSignup,
+)
+
+
+@admin.register(PlayerProfile)
+class PlayerProfileAdmin(admin.ModelAdmin):
+	list_display = ["user", "updated_at"]
+	search_fields = ["user__username", "user__email", "bio"]
+	filter_horizontal = ["preferred_sports"]
+
+
+@admin.register(TournamentReport)
+class TournamentReportAdmin(admin.ModelAdmin):
+	list_display = ["id", "reporter", "tournament", "reported_player", "reason", "status", "created_at"]
+	list_filter = ["status", "reason", "created_at"]
+	search_fields = ["reporter__username", "reported_player__username", "tournament__title", "details"]
+	readonly_fields = ["reporter", "tournament", "reported_player", "reason", "details", "created_at"]
+
+
+@admin.register(TournamentWaitlist)
+class TournamentWaitlistAdmin(admin.ModelAdmin):
+	list_display = ["tournament", "user", "joined_at"]
+	list_filter = ["joined_at"]
+	search_fields = ["tournament__title", "user__username"]
+
+
+@admin.register(TournamentMessage)
+class TournamentMessageAdmin(admin.ModelAdmin):
+	list_display = ["tournament", "sender", "created_at"]
+	search_fields = ["tournament__title", "sender__username", "body"]
+	readonly_fields = ["created_at"]
+
+
+@admin.register(UserNotification)
+class UserNotificationAdmin(admin.ModelAdmin):
+	list_display = ["user", "kind", "tournament", "is_read", "created_at"]
+	list_filter = ["kind", "is_read", "created_at"]
+	search_fields = ["user__username", "message", "tournament__title"]
+	readonly_fields = ["created_at"]
 
 
 class CountryCurrencyInline(admin.TabularInline):

@@ -23,15 +23,24 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import Country, PaystackTransaction, Sport, Tournament, TournamentParticipant, Venue, WaitlistSignup
+from .models import (
+    Country, PaystackTransaction, PlayerProfile, Sport, Tournament,
+    TournamentMessage, TournamentParticipant, TournamentReport, TournamentWaitlist,
+    UserNotification, Venue, WaitlistSignup,
+)
 from .permissions import IsTournamentHostOrReadOnly
 from .serializers import (
     JoinTournamentSerializer,
     CountrySerializer,
+    PlayerProfileSerializer,
     RegisterSerializer,
     SportSerializer,
+    TournamentMessageSerializer,
     TournamentParticipantSerializer,
+    TournamentReportSerializer,
     TournamentSerializer,
+    TournamentWaitlistSerializer,
+    UserNotificationSerializer,
     UserSerializer,
     VenueSerializer,
     WaitlistSignupSerializer,
@@ -121,6 +130,25 @@ def finalize_paystack_payment(payment, transaction_data):
     return True
 
 
+def notify_waitlist_head(tournament):
+    waiting = tournament.waitlist_entries.select_related("user").first()
+    if waiting:
+        UserNotification.objects.create(
+            user=waiting.user,
+            tournament=tournament,
+            kind=UserNotification.Kind.SPOT_OPEN,
+            message=f"A spot opened in {tournament.title}. Claim it before it is taken.",
+        )
+
+
+def notify_participants(tournament, kind, message):
+    user_ids = tournament.active_participants().exclude(user=tournament.host).values_list("user_id", flat=True)
+    UserNotification.objects.bulk_create([
+        UserNotification(user_id=user_id, tournament=tournament, kind=kind, message=message)
+        for user_id in user_ids
+    ])
+
+
 class RegisterView(APIView):
     permission_classes = [AllowAny]
 
@@ -164,6 +192,105 @@ class CurrentUserView(RetrieveAPIView):
 
     def get_object(self):
         return self.request.user
+
+
+class MyPlayerProfileView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get_profile(self, request):
+        profile, _ = PlayerProfile.objects.get_or_create(user=request.user)
+        return profile
+
+    def get(self, request):
+        profile = self.get_profile(request)
+        data = PlayerProfileSerializer(profile).data
+        data["games_played"] = request.user.tournament_entries.filter(
+            payment_status__in=[
+                TournamentParticipant.PaymentStatus.PAID,
+                TournamentParticipant.PaymentStatus.NOT_REQUIRED,
+            ],
+            tournament__status=Tournament.Status.COMPLETED,
+        ).count()
+        completed = Tournament.objects.filter(
+            participants__user=request.user,
+            status=Tournament.Status.COMPLETED,
+            participants__payment_status__in=[
+                TournamentParticipant.PaymentStatus.PAID,
+                TournamentParticipant.PaymentStatus.NOT_REQUIRED,
+            ],
+        ).select_related("host", "sport", "venue", "country").distinct()
+        data["completed_games"] = TournamentSerializer(
+            completed, many=True, context={"request": request}
+        ).data
+        return Response(data)
+
+    def patch(self, request):
+        profile = self.get_profile(request)
+        serializer = PlayerProfileSerializer(profile, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(self.get(request).data)
+
+
+class PublicPlayerProfileView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, username):
+        player = get_object_or_404(User, username=username)
+        profile = PlayerProfile.objects.filter(user=player).first()
+        data = PlayerProfileSerializer(profile).data if profile else {
+            "username": player.username,
+            "first_name": player.first_name,
+            "last_name": player.last_name,
+            "bio": "",
+            "preferred_sports": [],
+        }
+        data["games_played"] = player.tournament_entries.filter(
+            payment_status__in=[
+                TournamentParticipant.PaymentStatus.PAID,
+                TournamentParticipant.PaymentStatus.NOT_REQUIRED,
+            ],
+            tournament__status=Tournament.Status.COMPLETED,
+        ).count()
+        completed = Tournament.objects.filter(
+            participants__user=player,
+            status=Tournament.Status.COMPLETED,
+            participants__payment_status__in=[
+                TournamentParticipant.PaymentStatus.PAID,
+                TournamentParticipant.PaymentStatus.NOT_REQUIRED,
+            ],
+        ).select_related("host", "sport", "venue", "country").distinct()
+        data["completed_games"] = TournamentSerializer(
+            completed, many=True, context={"request": request}
+        ).data
+        return Response(data)
+
+
+class NotificationsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        notifications = UserNotification.objects.filter(user=request.user)[:50]
+        return Response(UserNotificationSerializer(notifications, many=True).data)
+
+    def post(self, request):
+        UserNotification.objects.filter(user=request.user, is_read=False).update(is_read=True)
+        return Response({"detail": "Notifications marked as read."})
+
+
+class TournamentReportView(APIView):
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "reports"
+
+    def post(self, request):
+        serializer = TournamentReportSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        report = serializer.save(reporter=request.user)
+        return Response(
+            {"id": report.id, "detail": "Thanks. Your report has been sent to the SportsClan team."},
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class SportViewSet(viewsets.ReadOnlyModelViewSet):
@@ -227,7 +354,10 @@ class TournamentViewSet(viewsets.ModelViewSet):
         return queryset
 
     def get_permissions(self):
-        if self.action in {"join", "leave", "mine", "payment_status", "payment_initialize", "payment_verify"}:
+        if self.action in {
+            "join", "leave", "mine", "payment_status", "payment_initialize",
+            "payment_verify", "waitlist", "messages",
+        }:
             return [IsAuthenticated()]
         return super().get_permissions()
 
@@ -280,6 +410,109 @@ class TournamentViewSet(viewsets.ModelViewSet):
             return self.get_paginated_response(serializer.data)
         return Response(self.get_serializer(self.get_queryset(), many=True).data)
 
+    @action(detail=True, methods=["get"])
+    def participants(self, request, pk=None):
+        tournament = self.get_object()
+        participants = tournament.active_participants().select_related("user").order_by("slot_number")
+        return Response(TournamentParticipantSerializer(participants, many=True).data)
+
+    @action(detail=True, methods=["get", "post", "delete"])
+    def waitlist(self, request, pk=None):
+        tournament = self.get_object()
+        if request.method == "GET":
+            entry = tournament.waitlist_entries.filter(user=request.user).first()
+            return Response(
+                TournamentWaitlistSerializer(entry).data if entry else {"joined": False}
+            )
+        if request.method == "DELETE":
+            tournament.waitlist_entries.filter(user=request.user).delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        if tournament.status not in {Tournament.Status.FULL, Tournament.Status.OPEN}:
+            raise ValidationError({"detail": "This tournament is not accepting waitlist requests."})
+        if tournament.slots_open > 0:
+            raise ValidationError({"detail": "This tournament still has open spots. Join directly."})
+        if tournament.starts_at <= timezone.now():
+            raise ValidationError({"detail": "This tournament has already started."})
+        if tournament.active_participants().filter(user=request.user).exists():
+            raise ValidationError({"detail": "You already have a spot in this tournament."})
+        entry, created = TournamentWaitlist.objects.get_or_create(
+            tournament=tournament, user=request.user
+        )
+        return Response(
+            TournamentWaitlistSerializer(entry).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["get", "post"])
+    def messages(self, request, pk=None):
+        tournament = self.get_object()
+        is_host = tournament.host_id == request.user.id
+        is_participant = tournament.active_participants().filter(user=request.user).exists()
+        if not is_host and not is_participant:
+            raise ValidationError({"detail": "Only the host and joined players can view game messages."})
+        if request.method == "GET":
+            messages = tournament.messages.select_related("sender")[:100]
+            return Response(TournamentMessageSerializer(messages, many=True).data)
+        if not is_host:
+            raise ValidationError({"detail": "Only the host can send a tournament announcement."})
+        serializer = TournamentMessageSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        message = serializer.save(tournament=tournament, sender=request.user)
+        notify_participants(
+            tournament,
+            UserNotification.Kind.HOST_ANNOUNCEMENT,
+            f"Update from {request.user.username}: {message.body[:350]}",
+        )
+        return Response(TournamentMessageSerializer(message).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        tournament = self.get_object()
+        if tournament.status in {Tournament.Status.CANCELLED, Tournament.Status.COMPLETED}:
+            raise ValidationError({"detail": "This tournament can no longer be cancelled."})
+        if tournament.active_participants().filter(
+            payment_status=TournamentParticipant.PaymentStatus.PAID
+        ).exists():
+            raise ValidationError(
+                {"detail": "Refund paid entries before cancelling this tournament."}
+            )
+        tournament.status = Tournament.Status.CANCELLED
+        tournament.save(update_fields=["status", "updated_at"])
+        notify_participants(
+            tournament,
+            UserNotification.Kind.TOURNAMENT_CANCELLED,
+            f"{tournament.title} has been cancelled by the host.",
+        )
+        waitlisted_user_ids = tournament.waitlist_entries.values_list("user_id", flat=True)
+        UserNotification.objects.bulk_create([
+            UserNotification(
+                user_id=user_id,
+                tournament=tournament,
+                kind=UserNotification.Kind.TOURNAMENT_CANCELLED,
+                message=f"{tournament.title} has been cancelled by the host.",
+            )
+            for user_id in waitlisted_user_ids
+        ])
+        tournament.waitlist_entries.all().delete()
+        return Response(self.get_serializer(tournament).data)
+
+    @action(detail=True, methods=["post"])
+    def complete(self, request, pk=None):
+        tournament = self.get_object()
+        if tournament.status in {Tournament.Status.CANCELLED, Tournament.Status.COMPLETED}:
+            raise ValidationError({"detail": "This tournament cannot be marked completed."})
+        ends_at = tournament.starts_at + timedelta(minutes=tournament.duration_minutes)
+        if ends_at > timezone.now():
+            raise ValidationError({"detail": "A game can be completed after its scheduled end time."})
+        tournament.status = Tournament.Status.COMPLETED
+        tournament.save(update_fields=["status", "updated_at"])
+        notify_participants(
+            tournament,
+            UserNotification.Kind.HOST_ANNOUNCEMENT,
+            f"{tournament.title} has been marked as completed.",
+        )
+        return Response(self.get_serializer(tournament).data)
+
     @action(detail=True, methods=["post"])
     def join(self, request, pk=None):
         input_serializer = JoinTournamentSerializer(data=request.data)
@@ -330,6 +563,7 @@ class TournamentViewSet(viewsets.ModelViewSet):
                         None if is_free else now + timedelta(minutes=RESERVATION_MINUTES)
                     ),
                 )
+                tournament.waitlist_entries.filter(user=request.user).delete()
                 if tournament.active_participants().count() >= tournament.max_players:
                     tournament.status = Tournament.Status.FULL
                     tournament.save(update_fields=["status", "updated_at"])
@@ -506,6 +740,7 @@ class TournamentViewSet(viewsets.ModelViewSet):
             if tournament.status == Tournament.Status.FULL:
                 tournament.status = Tournament.Status.OPEN
                 tournament.save(update_fields=["status", "updated_at"])
+                notify_waitlist_head(tournament)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 

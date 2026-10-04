@@ -22,6 +22,18 @@ The API runs at `http://127.0.0.1:8000/api/v1/`. `seed_countries` loads ISO coun
 
 For each venue, Admin supports `free`, `fixed`, `hourly`, and `quote` pricing. Free venues use zero; fixed and hourly rates need an amount and currency; quote venues leave the rate blank. Tournaments store their duration and a snapshot of the selected venue rate. The API returns `venue_fee_estimate`; hourly estimates use `rate × duration_minutes / 60`. Hosts can PATCH `venue_fee` and `venue_fee_status: "agreed"` after the venue confirms the booking. That records an agreement only; it does not verify or process payment.
 
+## Deploying on Render
+
+The web service must apply Django migrations before serving API requests. Set its Render start command to:
+
+```sh
+python manage.py migrate --noinput && python manage.py seed_catalog && python manage.py seed_countries && gunicorn config.wsgi:application --bind 0.0.0.0:$PORT
+```
+
+Errors such as `no such table: tournaments_country` mean migrations were not applied to the database used by the running service. For an immediate repair, run `python manage.py migrate --noinput`, `python manage.py seed_catalog`, and `python manage.py seed_countries` in that service's Render Shell, then restart it.
+
+The settings fall back to SQLite when `DATABASE_URL` is absent. Render's web-service filesystem is ephemeral unless a persistent disk is mounted, so configure a managed PostgreSQL database and set `DATABASE_URL` to keep accounts and game data across deploys/restarts. Configure the start command above after connecting the database.
+
 ## API endpoints
 
 | Method | Endpoint | Auth | Purpose |
@@ -31,12 +43,21 @@ For each venue, Admin supports `free`, `fixed`, `hourly`, and `quote` pricing. F
 | `POST` | `/api/v1/auth/token/` | No | Log in with username and password |
 | `POST` | `/api/v1/auth/token/refresh/` | No | Get a new access token |
 | `GET` | `/api/v1/auth/me/` | Yes | Get the signed-in user |
+| `GET, PATCH` | `/api/v1/profiles/me/` | Yes | Read or update player details and preferred sports |
+| `GET` | `/api/v1/players/{username}/` | No | View a player card and completed-game history |
+| `GET, POST` | `/api/v1/notifications/` | Yes | Read notifications or mark all as read |
+| `POST` | `/api/v1/reports/` | Yes | Report one game or player for admin review |
 | `GET` | `/api/v1/sports/` | No | List active sports |
 | `GET` | `/api/v1/countries/` | No | List countries, default currencies, and supported currencies |
 | `GET` | `/api/v1/venues/?city=Springfield&sports__slug=basketball` | No | Find local venues |
 | `GET, POST` | `/api/v1/tournaments/` | POST requires auth | Browse or create tournaments |
 | `GET, PATCH, DELETE` | `/api/v1/tournaments/{id}/` | Changes require host | View or manage a tournament |
 | `POST` | `/api/v1/tournaments/{id}/join/` | Yes | Claim an open numbered spot |
+| `GET` | `/api/v1/tournaments/{id}/participants/` | No | View joined players and spot/payment states |
+| `GET, POST, DELETE` | `/api/v1/tournaments/{id}/waitlist/` | Yes | Join, inspect, or leave the queue for a full game |
+| `GET, POST` | `/api/v1/tournaments/{id}/messages/` | Yes | Read game updates; hosts can send announcements |
+| `POST` | `/api/v1/tournaments/{id}/cancel/` | Host | Cancel a game and notify players |
+| `POST` | `/api/v1/tournaments/{id}/complete/` | Host | Mark an ended game complete for player history |
 | `DELETE` | `/api/v1/tournaments/{id}/leave/` | Yes | Leave before the entry is paid |
 | `GET` | `/api/v1/tournaments/{id}/payment-status/` | Yes | Read the player's reservation and payment status |
 | `POST` | `/api/v1/tournaments/{id}/payment-initialize/` | Yes | Create or reuse a Paystack checkout |

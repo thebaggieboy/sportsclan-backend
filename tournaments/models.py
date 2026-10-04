@@ -35,6 +35,18 @@ class WaitlistSignup(models.Model):
 		return f"{self.email} ({self.interest})"
 
 
+class PlayerProfile(models.Model):
+	user = models.OneToOneField(
+		settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="sports_profile"
+	)
+	bio = models.CharField(max_length=280, blank=True)
+	preferred_sports = models.ManyToManyField("Sport", blank=True, related_name="players")
+	updated_at = models.DateTimeField(auto_now=True)
+
+	def __str__(self):
+		return f"Profile for {self.user}"
+
+
 class Country(models.Model):
 	code = models.CharField(max_length=2, primary_key=True)
 	name = models.CharField(max_length=100)
@@ -347,6 +359,90 @@ class TournamentParticipant(models.Model):
 
 	def __str__(self):
 		return f"{self.user} in {self.tournament} (slot {self.slot_number})"
+
+
+class TournamentWaitlist(models.Model):
+	tournament = models.ForeignKey(
+		Tournament, on_delete=models.CASCADE, related_name="waitlist_entries"
+	)
+	user = models.ForeignKey(
+		settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="tournament_waitlist_entries"
+	)
+	joined_at = models.DateTimeField(auto_now_add=True)
+	notified_at = models.DateTimeField(null=True, blank=True)
+
+	class Meta:
+		ordering = ["joined_at", "id"]
+		constraints = [
+			models.UniqueConstraint(fields=["tournament", "user"], name="unique_tournament_waitlist_user")
+		]
+
+
+class TournamentMessage(models.Model):
+	tournament = models.ForeignKey(
+		Tournament, on_delete=models.CASCADE, related_name="messages"
+	)
+	sender = models.ForeignKey(
+		settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="tournament_messages"
+	)
+	body = models.CharField(max_length=1000)
+	created_at = models.DateTimeField(auto_now_add=True)
+
+	class Meta:
+		ordering = ["-created_at"]
+
+
+class UserNotification(models.Model):
+	class Kind(models.TextChoices):
+		SPOT_OPEN = "spot_open", "A spot opened"
+		TOURNAMENT_CANCELLED = "tournament_cancelled", "Tournament cancelled"
+		HOST_ANNOUNCEMENT = "host_announcement", "Host announcement"
+
+	user = models.ForeignKey(
+		settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="sports_notifications"
+	)
+	tournament = models.ForeignKey(
+		Tournament, null=True, blank=True, on_delete=models.CASCADE, related_name="notifications"
+	)
+	kind = models.CharField(max_length=24, choices=Kind.choices)
+	message = models.CharField(max_length=500)
+	is_read = models.BooleanField(default=False)
+	created_at = models.DateTimeField(auto_now_add=True)
+
+	class Meta:
+		ordering = ["-created_at"]
+		indexes = [models.Index(fields=["user", "is_read", "-created_at"])]
+
+
+class TournamentReport(models.Model):
+	class Reason(models.TextChoices):
+		SPAM = "spam", "Spam or misleading"
+		ABUSE = "abuse", "Abusive or unsafe"
+		FAKE = "fake", "Fake event or impersonation"
+		OTHER = "other", "Other"
+
+	class Status(models.TextChoices):
+		OPEN = "open", "Open"
+		REVIEWING = "reviewing", "Reviewing"
+		RESOLVED = "resolved", "Resolved"
+
+	reporter = models.ForeignKey(
+		settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="sports_reports"
+	)
+	tournament = models.ForeignKey(
+		Tournament, null=True, blank=True, on_delete=models.CASCADE, related_name="reports"
+	)
+	reported_player = models.ForeignKey(
+		settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.CASCADE,
+		related_name="reports_against",
+	)
+	reason = models.CharField(max_length=12, choices=Reason.choices)
+	details = models.CharField(max_length=1000, blank=True)
+	status = models.CharField(max_length=12, choices=Status.choices, default=Status.OPEN)
+	created_at = models.DateTimeField(auto_now_add=True)
+
+	class Meta:
+		ordering = ["-created_at"]
 
 
 class PaystackTransaction(models.Model):

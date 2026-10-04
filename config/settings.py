@@ -124,7 +124,7 @@ REST_FRAMEWORK = {
         "rest_framework.filters.SearchFilter",
     ],
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
-    "DEFAULT_THROTTLE_RATES": {"waitlist": "10/hour"},
+    "DEFAULT_THROTTLE_RATES": {"waitlist": "10/hour", "reports": "5/hour"},
     "PAGE_SIZE": 20,
     "DEFAULT_SCHEMA_CLASS": "rest_framework.schemas.openapi.AutoSchema",
 }

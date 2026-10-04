@@ -5,7 +5,11 @@ from django.contrib.auth.password_validation import validate_password
 from django.utils import timezone
 from rest_framework import serializers
 
-from .models import Country, CountryCurrency, Currency, Sport, Tournament, TournamentParticipant, Venue, WaitlistSignup
+from .models import (
+    Country, CountryCurrency, Currency, PlayerProfile, Sport, Tournament,
+    TournamentMessage, TournamentParticipant, TournamentReport, UserNotification,
+    TournamentWaitlist, Venue, WaitlistSignup,
+)
 
 User = get_user_model()
 
@@ -51,6 +55,39 @@ class SportSerializer(serializers.ModelSerializer):
     class Meta:
         model = Sport
         fields = ["id", "name", "slug"]
+
+
+class PlayerProfileSerializer(serializers.ModelSerializer):
+    username = serializers.CharField(source="user.username", read_only=True)
+    first_name = serializers.CharField(source="user.first_name", required=False, allow_blank=True)
+    last_name = serializers.CharField(source="user.last_name", required=False, allow_blank=True)
+    preferred_sport_ids = serializers.PrimaryKeyRelatedField(
+        source="preferred_sports",
+        queryset=Sport.objects.filter(is_active=True),
+        many=True,
+        required=False,
+        write_only=True,
+    )
+    preferred_sports = SportSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = PlayerProfile
+        fields = [
+            "username", "first_name", "last_name", "bio",
+            "preferred_sports", "preferred_sport_ids",
+        ]
+
+    def update(self, instance, validated_data):
+        user_data = validated_data.pop("user", {})
+        for field, value in user_data.items():
+            setattr(instance.user, field, value)
+        if user_data:
+            instance.user.save(update_fields=list(user_data))
+        sports = validated_data.pop("preferred_sports", None)
+        instance = super().update(instance, validated_data)
+        if sports is not None:
+            instance.preferred_sports.set(sports)
+        return instance
 
 
 class CurrencyOptionSerializer(serializers.ModelSerializer):
@@ -135,6 +172,8 @@ class TournamentSerializer(serializers.ModelSerializer):
     is_joined = serializers.SerializerMethodField()
     my_slot = serializers.SerializerMethodField()
     my_payment_status = serializers.SerializerMethodField()
+    is_waitlisted = serializers.SerializerMethodField()
+    waitlist_position = serializers.SerializerMethodField()
     status = serializers.SerializerMethodField()
     venue_fee = serializers.DecimalField(
         max_digits=12, decimal_places=2, required=False, allow_null=True
@@ -217,6 +256,8 @@ class TournamentSerializer(serializers.ModelSerializer):
             "is_joined",
             "my_slot",
             "my_payment_status",
+            "is_waitlisted",
+            "waitlist_position",
             "created_at",
             "updated_at",
         ]
@@ -256,6 +297,22 @@ class TournamentSerializer(serializers.ModelSerializer):
             return None
         participant = tournament.participants.filter(user=request.user).first()
         return participant.payment_status if participant else None
+
+    def get_is_waitlisted(self, tournament):
+        request = self.context.get("request")
+        return bool(
+            request and request.user.is_authenticated
+            and tournament.waitlist_entries.filter(user=request.user).exists()
+        )
+
+    def get_waitlist_position(self, tournament):
+        request = self.context.get("request")
+        if not request or not request.user.is_authenticated:
+            return None
+        entry = tournament.waitlist_entries.filter(user=request.user).first()
+        if entry is None:
+            return None
+        return tournament.waitlist_entries.filter(joined_at__lt=entry.joined_at).count() + 1
 
     def get_status(self, tournament):
         if (
@@ -347,17 +404,72 @@ class JoinTournamentSerializer(serializers.Serializer):
 
 
 class TournamentParticipantSerializer(serializers.ModelSerializer):
+    user_id = serializers.IntegerField(source="user.id", read_only=True)
     username = serializers.CharField(source="user.username", read_only=True)
+    first_name = serializers.CharField(source="user.first_name", read_only=True)
+    last_name = serializers.CharField(source="user.last_name", read_only=True)
 
     class Meta:
         model = TournamentParticipant
         fields = [
             "id",
+            "user_id",
             "username",
+            "first_name",
+            "last_name",
             "slot_number",
             "entry_fee_at_join",
             "payment_status",
             "reservation_expires_at",
             "joined_at",
         ]
+        read_only_fields = fields
+
+
+class TournamentWaitlistSerializer(serializers.ModelSerializer):
+    position = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TournamentWaitlist
+        fields = ["id", "position", "joined_at"]
+        read_only_fields = fields
+
+    def get_position(self, entry):
+        return TournamentWaitlist.objects.filter(
+            tournament=entry.tournament,
+            joined_at__lt=entry.joined_at,
+        ).count() + 1
+
+
+class TournamentMessageSerializer(serializers.ModelSerializer):
+    sender = serializers.CharField(source="sender.username", read_only=True)
+
+    class Meta:
+        model = TournamentMessage
+        fields = ["id", "sender", "body", "created_at"]
+        read_only_fields = ["id", "sender", "created_at"]
+
+    def validate_body(self, value):
+        return value.strip()
+
+
+class TournamentReportSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TournamentReport
+        fields = ["tournament", "reported_player", "reason", "details"]
+
+    def validate(self, attrs):
+        if bool(attrs.get("tournament")) == bool(attrs.get("reported_player")):
+            raise serializers.ValidationError("Choose exactly one game or player to report.")
+        if attrs.get("reported_player") == self.context["request"].user:
+            raise serializers.ValidationError({"reported_player": "You cannot report yourself."})
+        return attrs
+
+
+class UserNotificationSerializer(serializers.ModelSerializer):
+    tournament_id = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = UserNotification
+        fields = ["id", "kind", "message", "tournament_id", "is_read", "created_at"]
         read_only_fields = fields
