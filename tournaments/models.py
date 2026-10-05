@@ -202,14 +202,14 @@ class Tournament(models.Model):
 		decimal_places=6,
 		null=True,
 		blank=True,
-		validators=[MinValueValidator(-90), MaxValueValidator(90)],
+		validators=[MinValueValidator(Decimal("-90")), MaxValueValidator(Decimal("90"))],
 	)
 	longitude = models.DecimalField(
 		max_digits=9,
 		decimal_places=6,
 		null=True,
 		blank=True,
-		validators=[MinValueValidator(-180), MaxValueValidator(180)],
+		validators=[MinValueValidator(Decimal("-180")), MaxValueValidator(Decimal("180"))],
 	)
 	country = models.ForeignKey(
 		Country,
@@ -235,7 +235,7 @@ class Tournament(models.Model):
 		decimal_places=2,
 		null=True,
 		blank=True,
-		validators=[MinValueValidator(0)],
+		validators=[MinValueValidator(Decimal("0.00"))],
 	)
 	venue_fee_status = models.CharField(
 		max_length=12,
@@ -246,7 +246,7 @@ class Tournament(models.Model):
 		max_digits=10,
 		decimal_places=2,
 		default=0,
-		validators=[MinValueValidator(0)],
+		validators=[MinValueValidator(Decimal("0.00"))],
 	)
 	currency = models.CharField(max_length=3, default="USD")
 	max_players = models.PositiveSmallIntegerField(validators=[MinValueValidator(1)])

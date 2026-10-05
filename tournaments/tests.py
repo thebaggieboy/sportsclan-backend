@@ -2,6 +2,7 @@ from datetime import timedelta
 import hashlib
 import hmac
 import json
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
@@ -504,6 +505,8 @@ class SportsClanApiTests(APITestCase):
         self.assertEqual(roster.data[0]["slot_number"], 1)
 
     def test_host_can_announce_to_players_and_cancel_with_notifications(self):
+        self.tournament.entry_fee = Decimal("0.00")
+        self.tournament.save(update_fields=["entry_fee"])
         self.client.force_authenticate(self.player)
         self.client.post(
             reverse("tournament-join", args=[self.tournament.id]),
