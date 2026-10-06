@@ -15,12 +15,13 @@ from rest_framework.test import APITestCase
 from .models import (
     Country, CountryCurrency, Currency, PaystackTransaction, Sport, Tournament,
     TournamentMessage, TournamentParticipant, TournamentReport, UserNotification,
-    Venue, WaitlistSignup,
+    TournamentWaitlist, Venue, WaitlistSignup,
 )
 
 User = get_user_model()
 
 
+@override_settings(TOURNAMENT_PAYMENTS_ENABLED=True)
 class SportsClanApiTests(APITestCase):
     @staticmethod
     def mock_paystack_response(data):
@@ -82,6 +83,15 @@ class SportsClanApiTests(APITestCase):
         self.assertEqual(country["currencies"][0]["code"], "USD")
         self.assertEqual(venues_response.status_code, status.HTTP_200_OK)
         self.assertEqual(venues_response.data["results"][0]["city"], "Springfield")
+
+    def test_tournaments_can_be_filtered_by_country(self):
+        us_games = self.client.get(reverse("tournament-list"), {"country__code": "US"})
+        ca_games = self.client.get(reverse("tournament-list"), {"country__code": "CA"})
+
+        self.assertEqual(us_games.status_code, status.HTTP_200_OK)
+        self.assertEqual(us_games.data["count"], 1)
+        self.assertEqual(ca_games.status_code, status.HTTP_200_OK)
+        self.assertEqual(ca_games.data["count"], 0)
 
     def test_registration_returns_tokens(self):
         response = self.client.post(
@@ -210,6 +220,8 @@ class SportsClanApiTests(APITestCase):
                 "title": "New Pin Tournament",
                 "sport_id": self.sport.id,
                 "venue_city": "Springfield",
+                "venue_address": "123 River Road, west entrance",
+                "postal_code": "62701",
                 "venue_name": "Westside Community Court",
                 "state": "Illinois",
                 "latitude": 39.7817,
@@ -227,6 +239,8 @@ class SportsClanApiTests(APITestCase):
         self.assertEqual(response.data["venue_name"], "Westside Community Court")
         self.assertEqual(response.data["state"], "Illinois")
         self.assertEqual(response.data["venue"]["city"], "Springfield")
+        self.assertEqual(response.data["venue"]["address"], "123 River Road, west entrance")
+        self.assertEqual(response.data["venue"]["postal_code"], "62701")
         self.assertEqual(response.data["latitude"], "39.781700")
         self.assertEqual(response.data["longitude"], "-89.650100")
         tournament = Tournament.objects.get(pk=response.data["id"])
@@ -234,6 +248,8 @@ class SportsClanApiTests(APITestCase):
         self.assertEqual(tournament.longitude, Decimal("-89.650100"))
         self.assertEqual(tournament.venue.latitude, Decimal("39.781700"))
         self.assertEqual(tournament.venue.longitude, Decimal("-89.650100"))
+        self.assertEqual(tournament.venue.address, "123 River Road, west entrance")
+        self.assertEqual(tournament.venue.postal_code, "62701")
 
     def test_tournament_currency_must_belong_to_selected_country(self):
         self.client.force_authenticate(self.host)
@@ -493,7 +509,349 @@ class SportsClanApiTests(APITestCase):
         left_again = self.client.delete(reverse("tournament-leave", args=[self.tournament.id]))
         self.assertEqual(left_again.status_code, status.HTTP_204_NO_CONTENT)
         self.assertEqual(UserNotification.objects.filter(user=waiting_user).count(), 1)
-        self.assertEqual(UserNotification.objects.get(user=second_waiting_user).kind, UserNotification.Kind.SPOT_OPEN)
+        self.assertFalse(UserNotification.objects.filter(user=second_waiting_user).exists())
+        waiting_entry = TournamentWaitlist.objects.get(
+            tournament=self.tournament, user=waiting_user
+        )
+        waiting_entry.offer_expires_at = timezone.now() - timedelta(seconds=1)
+        waiting_entry.save(update_fields=["offer_expires_at"])
+        self.client.force_authenticate(second_waiting_user)
+        current_offer = self.client.get(waitlist_url)
+        self.assertEqual(current_offer.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            current_offer.data["offered_slot_number"],
+            1,
+        )
+        self.assertEqual(
+            UserNotification.objects.get(user=second_waiting_user).kind,
+            UserNotification.Kind.SPOT_OPEN,
+        )
+
+    def test_waitlist_offer_reserves_spot_for_fifo_user_until_claim_or_expiry(self):
+        self.client.force_authenticate(self.player)
+        self.client.post(
+            reverse("tournament-join", args=[self.tournament.id]),
+            {"slot_number": 1},
+            format="json",
+        )
+        self.client.force_authenticate(self.other_player)
+        self.client.post(
+            reverse("tournament-join", args=[self.tournament.id]),
+            {"slot_number": 2},
+            format="json",
+        )
+        first = User.objects.create_user(
+            username="firstwaiter", email="first@example.com", password="test-password-123"
+        )
+        second = User.objects.create_user(
+            username="secondwaiter", email="second@example.com", password="test-password-123"
+        )
+        waitlist_url = reverse("tournament-waitlist", args=[self.tournament.id])
+        join_url = reverse("tournament-join", args=[self.tournament.id])
+        self.client.force_authenticate(first)
+        self.client.post(waitlist_url, format="json")
+        self.client.force_authenticate(second)
+        self.client.post(waitlist_url, format="json")
+
+        self.client.force_authenticate(self.other_player)
+        self.client.delete(reverse("tournament-leave", args=[self.tournament.id]))
+        first_entry = TournamentWaitlist.objects.get(tournament=self.tournament, user=first)
+        self.assertEqual(first_entry.offered_slot_number, 2)
+        self.assertGreater(first_entry.offer_expires_at, timezone.now())
+
+        late_joiner = User.objects.create_user(
+            username="latejoiner", email="late@example.com", password="test-password-123"
+        )
+        self.client.force_authenticate(late_joiner)
+        blocked = self.client.post(join_url, {"slot_number": 2}, format="json")
+        self.assertEqual(blocked.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("reserved for the next waitlisted player", blocked.data["detail"])
+
+        self.client.force_authenticate(first)
+        claimed = self.client.post(join_url, {"slot_number": 2}, format="json")
+        self.assertEqual(claimed.status_code, status.HTTP_201_CREATED)
+        self.assertFalse(
+            TournamentWaitlist.objects.filter(tournament=self.tournament, user=first).exists()
+        )
+
+    @override_settings(TOURNAMENT_PAYMENTS_ENABLED=False)
+    def test_paid_tournament_creation_and_join_are_paused_until_host_payouts_exist(self):
+        self.client.force_authenticate(self.host)
+        response = self.client.post(
+            reverse("tournament-list"),
+            {
+                "title": "Paid game",
+                "sport_id": self.sport.id,
+                "venue_id": self.venue.id,
+                "country_id": self.country.code,
+                "starts_at": (timezone.now() + timedelta(days=3)).isoformat(),
+                "entry_fee": "5.00",
+                "currency": "USD",
+                "max_players": 4,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("organizer payouts", response.data["entry_fee"][0])
+
+        self.client.force_authenticate(self.player)
+        joined = self.client.post(
+            reverse("tournament-join", args=[self.tournament.id]),
+            {"slot_number": 1},
+            format="json",
+        )
+        self.assertEqual(joined.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("organizer payouts", joined.data["detail"])
+
+    @override_settings(TOURNAMENT_PAYMENTS_ENABLED=False, PAYSTACK_SECRET_KEY="sk_test_example")
+    def test_late_paystack_success_does_not_allocate_a_spot_while_payments_are_disabled(self):
+        participant = TournamentParticipant.objects.create(
+            tournament=self.tournament,
+            user=self.player,
+            slot_number=1,
+            entry_fee_at_join="5.00",
+            payment_status=TournamentParticipant.PaymentStatus.PENDING,
+            reservation_expires_at=timezone.now() + timedelta(minutes=10),
+        )
+        payment = PaystackTransaction.objects.create(
+            participant=participant,
+            reference="sc-disabled-payment",
+            amount_minor=500,
+            currency="USD",
+        )
+        event_body = json.dumps({
+            "event": "charge.success",
+            "data": {
+                "reference": payment.reference,
+                "status": "success",
+                "amount": 500,
+                "currency": "USD",
+            },
+        }).encode()
+        signature = hmac.new(
+            b"sk_test_example", event_body, hashlib.sha512
+        ).hexdigest()
+        response = self.client.post(
+            reverse("paystack-webhook"),
+            event_body,
+            content_type="application/json",
+            HTTP_X_PAYSTACK_SIGNATURE=signature,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        payment.refresh_from_db()
+        participant.refresh_from_db()
+        self.assertEqual(
+            payment.status, PaystackTransaction.Status.SUCCESS_UNALLOCATED
+        )
+        self.assertEqual(
+            participant.payment_status, TournamentParticipant.PaymentStatus.PENDING
+        )
+
+    @override_settings(PAYSTACK_SECRET_KEY="sk_test_example")
+    @patch("tournaments.views.urlopen")
+    def test_player_can_leave_paid_entry_and_refund_before_24_hour_cutoff(self, mock_urlopen):
+        participant = TournamentParticipant.objects.create(
+            tournament=self.tournament,
+            user=self.player,
+            slot_number=1,
+            entry_fee_at_join="5.00",
+            payment_status=TournamentParticipant.PaymentStatus.PAID,
+        )
+        payment = PaystackTransaction.objects.create(
+            participant=participant,
+            reference="sc-refund-player",
+            amount_minor=500,
+            currency="USD",
+            status=PaystackTransaction.Status.SUCCESS,
+        )
+        mock_urlopen.return_value = self.mock_paystack_response({"status": "processed"})
+        self.client.force_authenticate(self.player)
+        response = self.client.delete(
+            reverse("tournament-leave", args=[self.tournament.id])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        payment.refresh_from_db()
+        self.assertEqual(
+            payment.refund_status, PaystackTransaction.RefundStatus.PROCESSED
+        )
+        sent_payload = json.loads(mock_urlopen.call_args.args[0].data)
+        self.assertEqual(sent_payload["transaction"], payment.reference)
+
+    @override_settings(PAYSTACK_SECRET_KEY="sk_test_example")
+    @patch("tournaments.views.urlopen")
+    def test_player_cannot_request_refund_within_24_hours(self, mock_urlopen):
+        self.tournament.starts_at = timezone.now() + timedelta(hours=12)
+        self.tournament.save(update_fields=["starts_at"])
+        participant = TournamentParticipant.objects.create(
+            tournament=self.tournament,
+            user=self.player,
+            slot_number=1,
+            entry_fee_at_join="5.00",
+            payment_status=TournamentParticipant.PaymentStatus.PAID,
+        )
+        PaystackTransaction.objects.create(
+            participant=participant,
+            reference="sc-refund-late",
+            amount_minor=500,
+            currency="USD",
+            status=PaystackTransaction.Status.SUCCESS,
+        )
+        self.client.force_authenticate(self.player)
+        response = self.client.delete(
+            reverse("tournament-leave", args=[self.tournament.id])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("at least 24 hours", response.data["detail"])
+        mock_urlopen.assert_not_called()
+
+    @override_settings(PAYSTACK_SECRET_KEY="sk_test_example")
+    @patch("tournaments.views.urlopen")
+    def test_host_cancellation_waits_for_full_paystack_refund(self, mock_urlopen):
+        participant = TournamentParticipant.objects.create(
+            tournament=self.tournament,
+            user=self.player,
+            slot_number=1,
+            entry_fee_at_join="5.00",
+            payment_status=TournamentParticipant.PaymentStatus.PAID,
+        )
+        payment = PaystackTransaction.objects.create(
+            participant=participant,
+            reference="sc-refund-host",
+            amount_minor=500,
+            currency="USD",
+            status=PaystackTransaction.Status.SUCCESS,
+        )
+        mock_urlopen.return_value = self.mock_paystack_response({"status": "pending"})
+        self.client.force_authenticate(self.host)
+        cancel_url = reverse("tournament-cancel", args=[self.tournament.id])
+        waiting = self.client.post(cancel_url, format="json")
+        self.assertEqual(waiting.status_code, status.HTTP_400_BAD_REQUEST)
+        self.tournament.refresh_from_db()
+        self.assertNotEqual(self.tournament.status, Tournament.Status.CANCELLED)
+        payment.refresh_from_db()
+        self.assertEqual(payment.refund_status, PaystackTransaction.RefundStatus.PENDING)
+
+        event_body = json.dumps({
+            "event": "refund.processed",
+            "data": {"transaction_reference": payment.reference},
+        }).encode()
+        signature = hmac.new(
+            b"sk_test_example", event_body, hashlib.sha512
+        ).hexdigest()
+        self.client.post(
+            reverse("paystack-webhook"),
+            event_body,
+            content_type="application/json",
+            HTTP_X_PAYSTACK_SIGNATURE=signature,
+        )
+        payment.refresh_from_db()
+        self.assertEqual(
+            payment.refund_status, PaystackTransaction.RefundStatus.PROCESSED
+        )
+        mock_urlopen.return_value = self.mock_paystack_response({"status": "processed"})
+        cancelled = self.client.post(cancel_url, format="json")
+        self.assertEqual(cancelled.status_code, status.HTTP_200_OK)
+        self.tournament.refresh_from_db()
+        self.assertEqual(self.tournament.status, Tournament.Status.CANCELLED)
+
+    @override_settings(PAYSTACK_SECRET_KEY="sk_test_example")
+    def test_processed_player_refund_releases_spot_and_offers_it_to_waitlist(self):
+        paid_entry = TournamentParticipant.objects.create(
+            tournament=self.tournament,
+            user=self.player,
+            slot_number=1,
+            entry_fee_at_join="5.00",
+            payment_status=TournamentParticipant.PaymentStatus.PAID,
+        )
+        TournamentParticipant.objects.create(
+            tournament=self.tournament,
+            user=self.other_player,
+            slot_number=2,
+            entry_fee_at_join="5.00",
+            payment_status=TournamentParticipant.PaymentStatus.NOT_REQUIRED,
+        )
+        self.tournament.status = Tournament.Status.FULL
+        self.tournament.save(update_fields=["status"])
+        waiter = User.objects.create_user(
+            username="refundwaiter",
+            email="refundwaiter@example.com",
+            password="test-password-123",
+        )
+        self.client.force_authenticate(waiter)
+        self.client.post(
+            reverse("tournament-waitlist", args=[self.tournament.id]),
+            format="json",
+        )
+        payment = PaystackTransaction.objects.create(
+            participant=paid_entry,
+            reference="sc-refund-webhook-player",
+            amount_minor=500,
+            currency="USD",
+            status=PaystackTransaction.Status.SUCCESS,
+            refund_status=PaystackTransaction.RefundStatus.PENDING,
+            release_on_refund=True,
+        )
+        event_body = json.dumps({
+            "event": "refund.processed",
+            "data": {"transaction_reference": payment.reference},
+        }).encode()
+        signature = hmac.new(
+            b"sk_test_example", event_body, hashlib.sha512
+        ).hexdigest()
+        response = self.client.post(
+            reverse("paystack-webhook"),
+            event_body,
+            content_type="application/json",
+            HTTP_X_PAYSTACK_SIGNATURE=signature,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(
+            TournamentParticipant.objects.filter(pk=paid_entry.pk).exists()
+        )
+        offered = TournamentWaitlist.objects.get(
+            tournament=self.tournament, user=waiter
+        )
+        self.assertEqual(offered.offered_slot_number, 1)
+
+    def test_host_cannot_change_price_after_a_player_pays(self):
+        TournamentParticipant.objects.create(
+            tournament=self.tournament,
+            user=self.player,
+            slot_number=1,
+            entry_fee_at_join="5.00",
+            payment_status=TournamentParticipant.PaymentStatus.PAID,
+        )
+        self.client.force_authenticate(self.host)
+        response = self.client.patch(
+            reverse("tournament-detail", args=[self.tournament.id]),
+            {"entry_fee": "8.00"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "cannot be changed after a player has paid",
+            str(response.data["detail"]),
+        )
+
+    def test_free_join_confirms_immediately_without_payment_reservation(self):
+        self.tournament.entry_fee = Decimal("0.00")
+        self.tournament.save(update_fields=["entry_fee"])
+        self.client.force_authenticate(self.player)
+        response = self.client.post(
+            reverse("tournament-join", args=[self.tournament.id]),
+            {"slot_number": 1},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(
+            response.data["payment_status"],
+            TournamentParticipant.PaymentStatus.NOT_REQUIRED,
+        )
+        self.assertIsNone(response.data["reservation_expires_at"])
 
     def test_participant_roster_includes_public_player_card_fields(self):
         self.client.force_authenticate(self.player)
@@ -508,6 +866,80 @@ class SportsClanApiTests(APITestCase):
         self.assertEqual(roster.data[0]["user_id"], self.player.id)
         self.assertEqual(roster.data[0]["username"], self.player.username)
         self.assertEqual(roster.data[0]["slot_number"], 1)
+
+    def test_host_records_attendance_and_player_can_dispute_no_show_report(self):
+        player_entry = TournamentParticipant.objects.create(
+            tournament=self.tournament,
+            user=self.player,
+            slot_number=1,
+            entry_fee_at_join="5.00",
+            payment_status=TournamentParticipant.PaymentStatus.NOT_REQUIRED,
+        )
+        attended_entry = TournamentParticipant.objects.create(
+            tournament=self.tournament,
+            user=self.other_player,
+            slot_number=2,
+            entry_fee_at_join="5.00",
+            payment_status=TournamentParticipant.PaymentStatus.NOT_REQUIRED,
+        )
+        self.tournament.starts_at = timezone.now() - timedelta(hours=3)
+        self.tournament.save(update_fields=["starts_at"])
+        self.client.force_authenticate(self.host)
+        completed = self.client.post(
+            reverse("tournament-complete", args=[self.tournament.id]), format="json"
+        )
+        self.assertEqual(completed.status_code, status.HTTP_200_OK)
+
+        attendance = self.client.post(
+            reverse("tournament-attendance", args=[self.tournament.id]),
+            {
+                "participants": [
+                    {
+                        "participant_id": player_entry.id,
+                        "attendance_status": TournamentParticipant.AttendanceStatus.NO_SHOW,
+                    },
+                    {
+                        "participant_id": attended_entry.id,
+                        "attendance_status": TournamentParticipant.AttendanceStatus.ATTENDED,
+                    },
+                ]
+            },
+            format="json",
+        )
+        self.assertEqual(attendance.status_code, status.HTTP_200_OK, attendance.data)
+
+        self.client.force_authenticate(self.player)
+        confirmed = self.client.post(
+            reverse("tournament-confirm-attendance", args=[self.tournament.id]),
+            format="json",
+        )
+        self.assertEqual(confirmed.status_code, status.HTTP_200_OK, confirmed.data)
+        player_entry.refresh_from_db()
+        self.assertTrue(player_entry.attendance_disputed)
+        self.assertTrue(player_entry.attendance_confirmed)
+
+        profile = self.client.get(reverse("my-player-profile"))
+        self.assertEqual(profile.data["reliability"]["games_attended"], 0)
+        self.assertEqual(profile.data["reliability"]["no_shows_reported"], 0)
+        self.assertEqual(profile.data["reliability"]["attendance_disputes"], 1)
+        self.client.force_authenticate(self.other_player)
+        attended_profile = self.client.get(reverse("my-player-profile"))
+        self.assertEqual(attended_profile.data["reliability"]["games_attended"], 1)
+
+    def test_host_last_minute_cancellation_is_recorded(self):
+        self.tournament.starts_at = timezone.now() + timedelta(hours=12)
+        self.tournament.save(update_fields=["starts_at"])
+        self.client.force_authenticate(self.host)
+        response = self.client.post(
+            reverse("tournament-cancel", args=[self.tournament.id]), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.tournament.refresh_from_db()
+        self.assertIsNotNone(self.tournament.cancelled_at)
+        self.client.force_authenticate(self.host)
+        profile = self.client.get(reverse("my-player-profile"))
+        self.assertEqual(profile.data["reliability"]["hosted_cancelled"], 1)
+        self.assertEqual(profile.data["reliability"]["hosted_last_minute_cancellations"], 1)
 
     def test_host_can_announce_to_players_and_cancel_with_notifications(self):
         self.tournament.entry_fee = Decimal("0.00")
@@ -621,4 +1053,4 @@ class SportsClanApiTests(APITestCase):
             reverse("tournament-cancel", args=[self.tournament.id]), format="json"
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("pending payment reservations", response.data["detail"])
+        self.assertIn("unpaid spot reservations", response.data["detail"])

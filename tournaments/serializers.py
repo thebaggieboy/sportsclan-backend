@@ -1,5 +1,7 @@
 from decimal import Decimal
+from datetime import timedelta
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.db.models import Q
@@ -91,6 +93,17 @@ class PlayerProfileSerializer(serializers.ModelSerializer):
         return instance
 
 
+class AttendanceUpdateSerializer(serializers.Serializer):
+    participant_id = serializers.IntegerField(min_value=1)
+    attendance_status = serializers.ChoiceField(
+        choices=[
+            TournamentParticipant.AttendanceStatus.ATTENDED,
+            TournamentParticipant.AttendanceStatus.NO_SHOW,
+            TournamentParticipant.AttendanceStatus.EXCUSED,
+        ]
+    )
+
+
 class CurrencyOptionSerializer(serializers.ModelSerializer):
     code = serializers.CharField(source="currency_id", read_only=True)
     name = serializers.CharField(source="currency.name", read_only=True)
@@ -122,6 +135,7 @@ class VenueSerializer(serializers.ModelSerializer):
             "name",
             "venue_name",
             "address",
+            "postal_code",
             "city",
             "region",
             "state",
@@ -149,6 +163,8 @@ class TournamentSerializer(serializers.ModelSerializer):
         required=False, allow_null=True,
     )
     venue_city = serializers.CharField(write_only=True, required=False, allow_blank=True, max_length=100)
+    venue_address = serializers.CharField(write_only=True, required=False, allow_blank=True, max_length=240)
+    postal_code = serializers.CharField(write_only=True, required=False, allow_blank=True, max_length=20)
     venue_name = serializers.CharField(required=False, allow_blank=True, max_length=160)
     state = serializers.CharField(required=False, allow_blank=True, max_length=100)
     latitude = serializers.DecimalField(max_digits=9, decimal_places=6, required=False, allow_null=True, min_value=Decimal("-90"), max_value=Decimal("90"))
@@ -175,7 +191,10 @@ class TournamentSerializer(serializers.ModelSerializer):
     my_payment_status = serializers.SerializerMethodField()
     is_waitlisted = serializers.SerializerMethodField()
     waitlist_position = serializers.SerializerMethodField()
+    waitlist_offers = serializers.SerializerMethodField()
     status = serializers.SerializerMethodField()
+    payments_enabled = serializers.SerializerMethodField()
+    player_refund_deadline = serializers.SerializerMethodField()
     venue_fee = serializers.DecimalField(
         max_digits=12, decimal_places=2, required=False, allow_null=True
     )
@@ -192,6 +211,8 @@ class TournamentSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         validated_data.pop("venue_city", None)
+        validated_data.pop("venue_address", None)
+        validated_data.pop("postal_code", None)
         venue = validated_data["venue"]
         validated_data["venue_name"] = validated_data.get("venue_name") or venue.name
         validated_data["state"] = validated_data.get("state") or venue.region
@@ -206,6 +227,8 @@ class TournamentSerializer(serializers.ModelSerializer):
         country = data["country"]
         venue = Venue.objects.create(
             name=data["venue_name"].strip(),
+            address=data.get("venue_address", "").strip(),
+            postal_code=data.get("postal_code", "").strip(),
             city=data["venue_city"].strip(),
             region=data.get("state", "").strip(),
             country=country.name,
@@ -231,6 +254,8 @@ class TournamentSerializer(serializers.ModelSerializer):
             "sport",
             "venue_id",
             "venue_city",
+            "venue_address",
+            "postal_code",
             "venue",
             "venue_name",
             "state",
@@ -253,6 +278,9 @@ class TournamentSerializer(serializers.ModelSerializer):
             "slots_taken",
             "slots_open",
             "taken_slots",
+            "waitlist_offers",
+            "payments_enabled",
+            "player_refund_deadline",
             "status",
             "is_joined",
             "my_slot",
@@ -326,6 +354,21 @@ class TournamentSerializer(serializers.ModelSerializer):
             return Tournament.Status.OPEN
         return tournament.status
 
+    def get_waitlist_offers(self, tournament):
+        now = timezone.now()
+        return list(
+            tournament.waitlist_entries.filter(
+                offer_expires_at__gt=now,
+                offered_slot_number__isnull=False,
+            ).values("offered_slot_number", "offer_expires_at")
+        )
+
+    def get_payments_enabled(self, tournament):
+        return settings.TOURNAMENT_PAYMENTS_ENABLED
+
+    def get_player_refund_deadline(self, tournament):
+        return tournament.starts_at - timedelta(hours=24)
+
     def validate(self, attrs):
         sport = attrs.get("sport", getattr(self.instance, "sport", None))
         venue = attrs.get("venue", getattr(self.instance, "venue", None))
@@ -333,6 +376,29 @@ class TournamentSerializer(serializers.ModelSerializer):
         currency = attrs.get("currency", getattr(self.instance, "currency", None))
         starts_at = attrs.get("starts_at", getattr(self.instance, "starts_at", None))
         max_players = attrs.get("max_players", getattr(self.instance, "max_players", None))
+        entry_fee = attrs.get("entry_fee", getattr(self.instance, "entry_fee", Decimal("0.00")))
+
+        if (
+            (self.instance is None or "entry_fee" in attrs)
+            and entry_fee > 0
+            and not settings.TOURNAMENT_PAYMENTS_ENABLED
+        ):
+            raise serializers.ValidationError(
+                {"entry_fee": "Paid tournaments are temporarily unavailable while organizer payouts are being set up."}
+            )
+
+        if self.instance and self.instance.participants.filter(
+            payment_status=TournamentParticipant.PaymentStatus.PAID
+        ).exists():
+            locked_fields = {
+                "entry_fee", "currency", "venue", "venue_id", "venue_name",
+                "state", "latitude", "longitude", "venue_city", "venue_address",
+                "postal_code",
+            }
+            if locked_fields.intersection(self.initial_data.keys()):
+                raise serializers.ValidationError(
+                    {"detail": "Price and venue details cannot be changed after a player has paid."}
+                )
 
         if self.instance is None and country is None:
             raise serializers.ValidationError({"country_id": "Choose a country."})
@@ -426,6 +492,9 @@ class TournamentParticipantSerializer(serializers.ModelSerializer):
             "payment_status",
             "reservation_expires_at",
             "joined_at",
+            "attendance_status",
+            "attendance_confirmed",
+            "attendance_disputed",
         ]
         read_only_fields = fields
 
@@ -435,7 +504,13 @@ class TournamentWaitlistSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = TournamentWaitlist
-        fields = ["id", "position", "joined_at"]
+        fields = [
+            "id",
+            "position",
+            "joined_at",
+            "offered_slot_number",
+            "offer_expires_at",
+        ]
         read_only_fields = fields
 
     def get_position(self, entry):

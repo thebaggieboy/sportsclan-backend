@@ -116,6 +116,7 @@ class Venue(models.Model):
 
 	name = models.CharField(max_length=160)
 	address = models.CharField(max_length=240, blank=True)
+	postal_code = models.CharField(max_length=20, blank=True)
 	city = models.CharField(max_length=100)
 	region = models.CharField(max_length=100, blank=True)
 	country = models.CharField(max_length=100, blank=True)
@@ -176,6 +177,7 @@ class Tournament(models.Model):
 	class Status(models.TextChoices):
 		OPEN = "open", "Open"
 		FULL = "full", "Full"
+		CANCELLING = "cancelling", "Cancelling"
 		CANCELLED = "cancelled", "Cancelled"
 		COMPLETED = "completed", "Completed"
 
@@ -255,6 +257,7 @@ class Tournament(models.Model):
 		choices=Status.choices,
 		default=Status.OPEN,
 	)
+	cancelled_at = models.DateTimeField(null=True, blank=True)
 	created_at = models.DateTimeField(auto_now_add=True)
 	updated_at = models.DateTimeField(auto_now=True)
 
@@ -328,6 +331,12 @@ class TournamentParticipant(models.Model):
 		REFUNDED = "refunded", "Refunded"
 		NOT_REQUIRED = "not_required", "Not required"
 
+	class AttendanceStatus(models.TextChoices):
+		UNMARKED = "unmarked", "Not marked"
+		ATTENDED = "attended", "Attended"
+		NO_SHOW = "no_show", "No-show reported"
+		EXCUSED = "excused", "Excused"
+
 	tournament = models.ForeignKey(
 		Tournament, on_delete=models.CASCADE, related_name="participants"
 	)
@@ -345,6 +354,13 @@ class TournamentParticipant(models.Model):
 	)
 	reservation_expires_at = models.DateTimeField(null=True, blank=True)
 	joined_at = models.DateTimeField(auto_now_add=True)
+	attendance_status = models.CharField(
+		max_length=12,
+		choices=AttendanceStatus.choices,
+		default=AttendanceStatus.UNMARKED,
+	)
+	attendance_confirmed = models.BooleanField(default=False)
+	attendance_disputed = models.BooleanField(default=False)
 
 	class Meta:
 		ordering = ["slot_number"]
@@ -370,6 +386,8 @@ class TournamentWaitlist(models.Model):
 	)
 	joined_at = models.DateTimeField(auto_now_add=True)
 	notified_at = models.DateTimeField(null=True, blank=True)
+	offered_slot_number = models.PositiveSmallIntegerField(null=True, blank=True)
+	offer_expires_at = models.DateTimeField(null=True, blank=True)
 
 	class Meta:
 		ordering = ["joined_at", "id"]
@@ -452,6 +470,12 @@ class PaystackTransaction(models.Model):
 		FAILED = "failed", "Failed"
 		SUCCESS_UNALLOCATED = "success_unallocated", "Success without reserved slot"
 
+	class RefundStatus(models.TextChoices):
+		NOT_REQUESTED = "not_requested", "Not requested"
+		PENDING = "pending", "Pending"
+		PROCESSED = "processed", "Processed"
+		FAILED = "failed", "Failed"
+
 	participant = models.ForeignKey(
 		TournamentParticipant,
 		null=True,
@@ -464,6 +488,12 @@ class PaystackTransaction(models.Model):
 	currency = models.CharField(max_length=3)
 	authorization_url = models.URLField(max_length=500, blank=True)
 	status = models.CharField(max_length=24, choices=Status.choices, default=Status.PENDING)
+	refund_status = models.CharField(
+		max_length=16,
+		choices=RefundStatus.choices,
+		default=RefundStatus.NOT_REQUESTED,
+	)
+	release_on_refund = models.BooleanField(default=False)
 	created_at = models.DateTimeField(auto_now_add=True)
 	updated_at = models.DateTimeField(auto_now=True)
 

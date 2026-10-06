@@ -2,7 +2,7 @@ from django.contrib import admin
 
 from .models import (
 	Country, CountryCurrency, Currency, PlayerProfile, Sport, Tournament,
-	TournamentMessage, TournamentParticipant, TournamentReport,
+	PaystackTransaction, TournamentMessage, TournamentParticipant, TournamentReport,
 	TournamentWaitlist, UserNotification, Venue, WaitlistSignup,
 )
 
@@ -24,9 +24,22 @@ class TournamentReportAdmin(admin.ModelAdmin):
 
 @admin.register(TournamentWaitlist)
 class TournamentWaitlistAdmin(admin.ModelAdmin):
-	list_display = ["tournament", "user", "joined_at"]
+	list_display = [
+		"tournament", "user", "joined_at", "offered_slot_number", "offer_expires_at"
+	]
 	list_filter = ["joined_at"]
 	search_fields = ["tournament__title", "user__username"]
+
+
+@admin.register(PaystackTransaction)
+class PaystackTransactionAdmin(admin.ModelAdmin):
+	list_display = [
+		"reference", "participant", "amount_minor", "currency", "status",
+		"refund_status", "created_at",
+	]
+	list_filter = ["status", "refund_status", "currency", "created_at"]
+	search_fields = ["reference", "participant__user__username", "participant__user__email"]
+	readonly_fields = ["created_at", "updated_at"]
 
 
 @admin.register(TournamentMessage)

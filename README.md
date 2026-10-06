@@ -52,6 +52,7 @@ The database switch does not copy existing rows from a previous SQLite database.
 | `GET` | `/api/v1/sports/` | No | List active sports |
 | `GET` | `/api/v1/countries/` | No | List countries, default currencies, and supported currencies |
 | `GET` | `/api/v1/venues/?city=Springfield&sports__slug=basketball` | No | Find local venues |
+| `GET` | `/api/v1/tournaments/?country__code=US` | No | Browse tournaments in a country |
 | `GET, POST` | `/api/v1/tournaments/` | POST requires auth | Browse or create tournaments |
 | `GET, PATCH, DELETE` | `/api/v1/tournaments/{id}/` | Changes require host | View or manage a tournament |
 | `POST` | `/api/v1/tournaments/{id}/join/` | Yes | Claim an open numbered spot |
@@ -111,6 +112,10 @@ Content-Type: application/json
 }
 ```
 
+When creating a new venue instead of sending `venue_id`, include `venue_name`, `venue_city`, `venue_address` (street address or directions), `postal_code`, `latitude`, and `longitude`. The address and postal code are stored on the venue and returned in the nested `venue` object; both are optional.
+
+After marking a game completed, the host can record each confirmed participant as attended, a no-show, or excused with `POST /api/v1/tournaments/{id}/attendance/` and a `participants` array of `{ "participant_id": 1, "attendance_status": "attended" }` records. Each participant may confirm attendance with `POST /api/v1/tournaments/{id}/confirm-attendance/`. If a player confirms attendance after a host has reported a no-show, that record is marked disputed and excluded from reliability counts. Profile reliability figures are transparent activity records only; they do not trigger automatic penalties or bans.
+
 Join a numbered spot:
 
 ```http
@@ -132,9 +137,15 @@ Successful paid joins save the fee at the time of joining and return a 15-minute
 3. The app opens the returned `authorization_url` and, after checkout, calls `POST /payment-verify/` with the returned reference. A browser redirect alone is not proof of payment.
 4. The server calls Paystack's verify endpoint and checks success, reference, amount, and currency before marking the participant paid. The signed webhook is an additional confirmation path.
 
-Set `PAYSTACK_SECRET_KEY` on the backend to a Paystack test secret while developing. Configure Paystack to send `charge.success` events to `https://<api-host>/api/v1/payments/paystack/webhook/`. Use HTTPS in deployed environments. Checkout currently accepts NGN, GHS, ZAR, KES, and USD. If a payment succeeds after its 15-minute hold has expired, the API records `success_unallocated` rather than taking another player's spot; that payment requires support/refund handling.
+Paid tournaments and checkout are disabled by default with `TOURNAMENT_PAYMENTS_ENABLED=false`. Keep them disabled until a tested organizer payout process exists; Paystack payments otherwise settle to the SportsClan merchant account, not to the host. New paid tournaments and paid joins are rejected by the API while the flag is off. Do not enable it until host proceeds, platform fees, support, and settlement are configured.
 
-Paid entries cannot leave until refunded. Hosts manage venues and sports through Admin in this first version.
+When payments are enabled for a configured deployment, unpaid spot reservations expire after 15 minutes. A player can cancel a paid entry and request a full Paystack refund at least 24 hours before the game starts; cancellations inside that cutoff are rejected. Host cancellations request full refunds for paid entries and remain incomplete until Paystack confirms every refund. Refund webhook events update the refund status; if a refund request times out, its status stays pending to avoid accidentally issuing a duplicate refund.
+
+Waitlist offers are FIFO and reserve a specific spot for 15 minutes. Only the player holding the current offer can claim that spot. If the offer expires or the player leaves the queue, the next player is notified. Tournament price and venue terms cannot be changed after a paid entry exists. The API exposes the refund deadline and active waitlist offers to the web and mobile clients.
+
+Set `PAYSTACK_SECRET_KEY` on the backend to a Paystack test secret while developing. Configure Paystack to send `charge.success`, `refund.pending`, `refund.processed`, and `refund.failed` events to `https://<api-host>/api/v1/payments/paystack/webhook/`. Use HTTPS in deployed environments. Checkout currently accepts NGN, GHS, ZAR, KES, and USD. If a payment succeeds after its 15-minute hold has expired, the API records `success_unallocated` rather than taking another player's spot; that payment requires support/refund handling.
+
+Hosts manage venues and sports through Admin in this first version.
 
 ## Tests
 

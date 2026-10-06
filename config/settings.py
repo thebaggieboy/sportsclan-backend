@@ -20,6 +20,9 @@ ALLOWED_HOSTS = [
 ]
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY", "")
 PAYSTACK_CALLBACK_URL = os.environ.get("PAYSTACK_CALLBACK_URL", "")
+TOURNAMENT_PAYMENTS_ENABLED = os.environ.get(
+    "TOURNAMENT_PAYMENTS_ENABLED", "false"
+).lower() in {"1", "true", "yes"}
 
 INSTALLED_APPS = [
     "django.contrib.admin",
