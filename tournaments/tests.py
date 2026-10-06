@@ -229,6 +229,11 @@ class SportsClanApiTests(APITestCase):
         self.assertEqual(response.data["venue"]["city"], "Springfield")
         self.assertEqual(response.data["latitude"], "39.781700")
         self.assertEqual(response.data["longitude"], "-89.650100")
+        tournament = Tournament.objects.get(pk=response.data["id"])
+        self.assertEqual(tournament.latitude, Decimal("39.781700"))
+        self.assertEqual(tournament.longitude, Decimal("-89.650100"))
+        self.assertEqual(tournament.venue.latitude, Decimal("39.781700"))
+        self.assertEqual(tournament.venue.longitude, Decimal("-89.650100"))
 
     def test_tournament_currency_must_belong_to_selected_country(self):
         self.client.force_authenticate(self.host)
