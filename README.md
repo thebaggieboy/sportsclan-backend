@@ -18,7 +18,7 @@ python manage.py createsuperuser
 python manage.py runserver
 ```
 
-The API runs at `http://127.0.0.1:8000/api/v1/`. `seed_countries` loads ISO countries and their current tender currencies. Add local stadiums, courts, and fields in Django Admin at `http://127.0.0.1:8000/admin/`, assign each venue its country, then connect it to its supported sports. SQLite is used by default. Set `DATABASE_URL` to use PostgreSQL.
+The API runs at `http://127.0.0.1:8000/api/v1/`. `seed_countries` loads ISO countries and their current tender currencies. Add local stadiums, courts, and fields in Django Admin at `http://127.0.0.1:8000/admin/`, assign each venue its country, then connect it to its supported sports. SQLite is used only for local development when `DATABASE_URL` is unset. Set `DATABASE_URL` to a PostgreSQL connection string to use PostgreSQL.
 
 For each venue, Admin supports `free`, `fixed`, `hourly`, and `quote` pricing. Free venues use zero; fixed and hourly rates need an amount and currency; quote venues leave the rate blank. Tournaments store their duration and a snapshot of the selected venue rate. The API returns `venue_fee_estimate`; hourly estimates use `rate × duration_minutes / 60`. Hosts can PATCH `venue_fee` and `venue_fee_status: "agreed"` after the venue confirms the booking. That records an agreement only; it does not verify or process payment.
 
@@ -32,7 +32,9 @@ python manage.py migrate --noinput && python manage.py seed_catalog && python ma
 
 Errors such as `no such table: tournaments_country` mean migrations were not applied to the database used by the running service. For an immediate repair, run `python manage.py migrate --noinput`, `python manage.py seed_catalog`, and `python manage.py seed_countries` in that service's Render Shell, then restart it.
 
-The settings fall back to SQLite when `DATABASE_URL` is absent. Render's web-service filesystem is ephemeral unless a persistent disk is mounted, so configure a managed PostgreSQL database and set `DATABASE_URL` to keep accounts and game data across deploys/restarts. Configure the start command above after connecting the database.
+In the Render web service's Environment settings, set `DATABASE_URL` to the PostgreSQL database's **Internal Database URL** (when the services are in the same region), and set `DJANGO_DEBUG=false`. Keep the connection URL secret; do not commit it to the repository. Production startup rejects a missing URL or a non-PostgreSQL database, and PostgreSQL connections require TLS. Render's web-service filesystem is ephemeral, so the managed PostgreSQL database is required to keep accounts and game data across deploys/restarts. The start command above applies migrations and loads catalog/country seed data into that database on deploy.
+
+The database switch does not copy existing rows from a previous SQLite database. Migrations create the schema in PostgreSQL and the seed commands load reference data; any existing SQLite accounts or tournaments must be migrated separately if they need to be retained.
 
 ## API endpoints
 

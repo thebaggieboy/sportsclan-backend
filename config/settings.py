@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
-DEBUG = os.environ.get("DJANGO_DEBUG", "true").lower() in {"1", "true", "yes"}
+DEBUG = os.environ.get("DJANGO_DEBUG", "false").lower() in {"1", "true", "yes"}
 SECRET_KEY = os.environ.get(
     "DJANGO_SECRET_KEY", "local-only-insecure-secret-key-change-this"
 )
@@ -66,10 +66,20 @@ WSGI_APPLICATION = "config.wsgi.application"
 ASGI_APPLICATION = "config.asgi.application"
 
 database_url = os.environ.get("DATABASE_URL")
+is_render = os.environ.get("RENDER", "").lower() == "true"
 if database_url:
     import dj_database_url
 
-    DATABASES = {"default": dj_database_url.parse(database_url, conn_max_age=600)}
+    database_config = dj_database_url.parse(
+        database_url, conn_max_age=600, ssl_require=not DEBUG or is_render
+    )
+    if database_config["ENGINE"] != "django.db.backends.postgresql":
+        raise RuntimeError("DATABASE_URL must point to PostgreSQL.")
+    DATABASES = {"default": database_config}
+elif not DEBUG or is_render:
+    raise RuntimeError(
+        "DATABASE_URL must be set to a PostgreSQL connection string in production."
+    )
 else:
     DATABASES = {
         "default": {
